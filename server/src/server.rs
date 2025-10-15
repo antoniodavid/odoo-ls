@@ -125,6 +125,7 @@ impl Server {
         if let Some(initialize_params) = initialize_params.process_id {
             self.client_process_id = initialize_params;
         }
+        #[allow(deprecated)]
         if let Some(workspace_folders) = initialize_params.workspace_folders {
             let sync_odoo = self.sync_odoo.lock().unwrap();
             let file_mgr = sync_odoo.get_file_mgr();
