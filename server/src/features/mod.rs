@@ -8,3 +8,4 @@ pub mod node_index_ast;
 pub mod references;
 pub mod workspace_symbols;
 pub mod xml_ast_utils;
+pub mod xml_completion;

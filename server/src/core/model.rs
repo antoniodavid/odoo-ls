@@ -71,7 +71,7 @@ impl ModelData {
 
 #[derive(Debug)]
 pub struct Model {
-    name: OYarn,
+    pub name: OYarn,
     symbols: PtrWeakHashSet<Weak<RefCell<Symbol>>>,
     pub dependents: PtrWeakHashSet<Weak<RefCell<Symbol>>>,
 }

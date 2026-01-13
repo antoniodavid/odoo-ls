@@ -55,9 +55,6 @@ impl XmlAstUtils {
                 "template" => {
                     XmlAstUtils::visit_template(session, &node, offset, from_module.clone(), ctxt, results, on_dep_only);
                 }
-                "xpath" => {
-                    XmlAstUtils::visit_xpath(session, &node, offset, from_module.clone(), ctxt, results, on_dep_only);
-                }
                 _ => {
                     for child in node.children() {
                         XmlAstUtils::visit_node(session, &child, offset, from_module.clone(), ctxt, results, on_dep_only);
@@ -70,13 +67,12 @@ impl XmlAstUtils {
     }
 
     fn visit_record(session: &mut SessionInfo<'_>, node: &Node, offset: usize, from_module: Option<Rc<RefCell<Symbol>>>, ctxt: &mut HashMap<String, ContextValue>, results: &mut (Vec<XmlAstResult>, Option<Range<usize>>), on_dep_only: bool) {
-        let mut model_name = String::new();
         for attr in node.attributes() {
             if attr.name() == "model" {
-                model_name = attr.value().to_string();
+                let model_name = attr.value().to_string();
                 ctxt.insert(S!("record_model"), ContextValue::STRING(model_name.clone()));
                 if attr.range_value().start <= offset && attr.range_value().end >= offset {
-                    if let Some(model) = session.sync_odoo.models.get(&Sy!(model_name.clone())).cloned() {
+                    if let Some(model) = session.sync_odoo.models.get(&Sy!(model_name)).cloned() {
                         let from_module = match on_dep_only {
                             true => from_module.clone(),
                             false => None,
@@ -92,29 +88,10 @@ impl XmlAstUtils {
                 }
             }
         }
-
-        if model_name == "ir.ui.view" {
-            for child in node.children() {
-                if child.is_element() && child.tag_name().name() == "field" {
-                    if let Some(name_attr) = child.attribute("name") {
-                        if name_attr == "model" {
-                            if let Some(text) = child.text() {
-                                let target_model = text.trim().to_string();
-                                if !target_model.is_empty() {
-                                    ctxt.insert(S!("view_target_model"), ContextValue::STRING(target_model));
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        }
-
         for child in node.children() {
             XmlAstUtils::visit_node(session, &child, offset, from_module.clone(), ctxt, results, on_dep_only);
         }
         ctxt.remove(&S!("record_model"));
-        ctxt.remove(&S!("view_target_model")); 
     }
 
     fn visit_field(session: &mut SessionInfo<'_>, node: &Node, offset: usize, from_module: Option<Rc<RefCell<Symbol>>>, ctxt: &mut HashMap<String, ContextValue>, results: &mut (Vec<XmlAstResult>, Option<Range<usize>>), on_dep_only: bool) {
@@ -123,7 +100,6 @@ impl XmlAstUtils {
                 ctxt.insert(S!("field_name"), ContextValue::STRING(attr.value().to_string()));
                 if attr.range_value().start <= offset && attr.range_value().end >= offset {
                     let model_name = ctxt.get(&S!("record_model")).cloned().unwrap_or(ContextValue::STRING(S!(""))).as_string();
-                    
                     if model_name.is_empty() {
                         continue;
                     }
@@ -150,48 +126,46 @@ impl XmlAstUtils {
                 }
             }
         }
-        
-        let mut is_arch = false;
-        for attr in node.attributes() {
-            if attr.name() == "name" && attr.value() == "arch" {
-                is_arch = true;
-                break;
-            }
-        }
-        
-        if is_arch {
-            if let Some(target) = ctxt.get(&S!("view_target_model")) {
-                let target_model = target.as_string();
-                ctxt.insert(S!("record_model"), ContextValue::STRING(target_model));
-            }
-        }
-
         for child in node.children() {
             XmlAstUtils::visit_node(session, &child, offset, from_module.clone(), ctxt, results, on_dep_only);
         }
-        
-        if is_arch {
-             ctxt.insert(S!("record_model"), ContextValue::STRING(S!("ir.ui.view")));
-        }
-        
         ctxt.remove(&S!("field_name"));
     }
 
-    fn visit_xpath(session: &mut SessionInfo<'_>, node: &Node, offset: usize, from_module: Option<Rc<RefCell<Symbol>>>, ctxt: &mut HashMap<String, ContextValue>, results: &mut (Vec<XmlAstResult>, Option<Range<usize>>), on_dep_only: bool) {
-        for child in node.children() {
-            XmlAstUtils::visit_node(session, &child, offset, from_module.clone(), ctxt, results, on_dep_only);
-        }
-    }
-
     fn visit_text(session: &mut SessionInfo, node: &Node, offset: usize, from_module: Option<Rc<RefCell<Symbol>>>, ctxt: &mut HashMap<String, ContextValue>, results: &mut (Vec<XmlAstResult>, Option<Range<usize>>), on_dep_only: bool) {
-        if node.range().start <= offset && node.range().end >= offset {
+        let field = ctxt.get(&S!("field_name")).cloned().unwrap_or(ContextValue::STRING(S!(""))).as_string();
+        if field.is_empty() {
+            return;
+        }
+        if field == "model" || field == "res_model" {
+            if let Some(text) = node.text() {
+                let model_name = Sy!(text.to_string());
+                if session.sync_odoo.models.contains_key(&model_name) {
+                    ctxt.insert(S!("record_model"), ContextValue::STRING(model_name.to_string()));
+                    if node.range().start <= offset && node.range().end >= offset {
+                        XmlAstUtils::add_model_result(session, node, from_module, results, on_dep_only);
+                    }
+                }
+            }
+        } else if node.range().start <= offset && node.range().end >= offset {
             let model = ctxt.get(&S!("record_model")).cloned().unwrap_or(ContextValue::STRING(S!(""))).as_string();
-            let field = ctxt.get(&S!("field_name")).cloned().unwrap_or(ContextValue::STRING(S!(""))).as_string();
-            if model.is_empty() || field.is_empty() {
+            if model.is_empty() {
                 return;
             }
-            if field == "model" || field == "res_model" { //do not check model, let's assume it will contains a model name
-                XmlAstUtils::add_model_result(session, node, from_module, results, on_dep_only);
+            if let Some(model) = session.sync_odoo.models.get(&Sy!(model)).cloned() {
+                let from_module = match on_dep_only {
+                    true => from_module.clone(),
+                    false => None,
+                };
+                for symbol in model.borrow().all_symbols(session, from_module, true) {
+                    if symbol.1.is_none() {
+                        let content = symbol.0.borrow().get_content_symbol(model.borrow().name.to_string().as_str(), u32::MAX);
+                        for symbol in content.symbols.iter() {
+                            results.0.push(XmlAstResult::SYMBOL(symbol.clone()));
+                        }
+                    }
+                }
+                results.1 = Some(node.range());
             }
         }
     }

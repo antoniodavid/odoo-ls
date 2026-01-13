@@ -9,6 +9,7 @@ use crate::features::workspace_symbols::WorkspaceSymbolFeature;
 use crate::fifo_ptr_weak_hash_set::FifoPtrWeakHashSet;
 use crate::threads::SessionInfo;
 use crate::features::completion::CompletionFeature;
+use crate::features::xml_completion::XmlCompletionFeature;
 use crate::features::definition::DefinitionFeature;
 use crate::features::hover::HoverFeature;
 use std::collections::HashMap;
@@ -1473,6 +1474,9 @@ impl Odoo {
                     file_info.borrow_mut().prepare_ast(session);
                 }
                 if file_info.borrow_mut().file_info_ast.borrow().indexed_module.is_some() {
+                    if path.ends_with(".xml") {
+                        return Ok(XmlCompletionFeature::autocomplete(session, &file_symbol, &file_info, params.text_document_position.position.line, params.text_document_position.position.character));
+                    }
                     return Ok(CompletionFeature::autocomplete(session, &file_symbol, &file_info, params.text_document_position.position.line, params.text_document_position.position.character));
                 }
             }
