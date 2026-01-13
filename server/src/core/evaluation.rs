@@ -1461,7 +1461,7 @@ impl Evaluation {
         diagnostics
     }
 
-    fn process_argument_diagnostics(session: &SessionInfo, expr_call: &ExprCall, diagnostics: Vec<Vec<Diagnostic>>, eval_count: usize) -> Vec<Diagnostic> {
+    fn process_argument_diagnostics(session: &SessionInfo, expr_call: &ExprCall, diagnostics: Vec<Vec<Diagnostic>>, _eval_count: usize) -> Vec<Diagnostic> {
         let mut filtered_diagnostics = vec![];
         //iter through diagnostics and check that each evaluation has the same amount of diagnostics with code OLS01007 or OLS01008 or OLS01010
         let all_same_issues = diagnostics.iter().fold_while(None, |acc, diags| {

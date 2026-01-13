@@ -158,7 +158,7 @@ pub trait PathSanitizer {
 impl PathSanitizer for PathBuf {
 
     fn sanitize(&self) -> String {
-        let mut path = self.to_slash_lossy().to_string();
+        let path = self.to_slash_lossy().to_string();
 
         #[cfg(windows)]
         {
@@ -204,7 +204,7 @@ impl PathSanitizer for PathBuf {
 impl PathSanitizer for Path {
 
     fn sanitize(&self) -> String {
-        let mut path = self.to_slash_lossy().to_string();
+        let path = self.to_slash_lossy().to_string();
 
         #[cfg(windows)]
         {

@@ -122,7 +122,7 @@ impl XmlAstUtils {
             if attr.name() == "name" {
                 ctxt.insert(S!("field_name"), ContextValue::STRING(attr.value().to_string()));
                 if attr.range_value().start <= offset && attr.range_value().end >= offset {
-                    let mut model_name = ctxt.get(&S!("record_model")).cloned().unwrap_or(ContextValue::STRING(S!(""))).as_string();
+                    let model_name = ctxt.get(&S!("record_model")).cloned().unwrap_or(ContextValue::STRING(S!(""))).as_string();
                     
                     if model_name.is_empty() {
                         continue;
