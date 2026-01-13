@@ -1,6 +1,5 @@
 use std::{cell::RefCell, rc::Rc};
 use lsp_types::{CompletionItem, CompletionItemKind, CompletionList, CompletionResponse};
-use roxmltree::Node;
 
 use crate::{
     core::{

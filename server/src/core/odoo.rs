@@ -1,3 +1,4 @@
+use crate::allocator::ALLOCATED;
 use crate::core::diagnostics::{create_diagnostic, DiagnosticCode};
 use crate::core::entry_point::EntryPointType;
 use crate::core::file_mgr::AstType;
@@ -746,6 +747,20 @@ impl SyncOdoo {
         }
         session.sync_odoo.import_cache = None;
         session.sync_odoo.watched_file_updates = 0;
+        
+        {
+            let mem_before = ALLOCATED.load(Ordering::Relaxed);
+            let file_mgr = session.sync_odoo.get_file_mgr();
+            let mut file_mgr = file_mgr.borrow_mut();
+            file_mgr.evict_all_external_asts();
+            file_mgr.shrink_collections();
+            drop(file_mgr);
+            let mem_after = ALLOCATED.load(Ordering::Relaxed);
+            let freed_mb = (mem_before.saturating_sub(mem_after)) as f64 / (1024.0 * 1024.0);
+            let current_mb = mem_after as f64 / (1024.0 * 1024.0);
+            info!("Memory after AST eviction: {:.1} MiB (freed {:.1} MiB)", current_mb, freed_mb);
+        }
+        
         if is_reporting_progress {
             session.send_notification(Progress::METHOD, ProgressParams {
                 token: ProgressToken::Number(session.sync_odoo.progress_token),
@@ -1387,6 +1402,7 @@ impl Odoo {
                 if file_info.borrow().file_info_ast.borrow().indexed_module.is_none() {
                     file_info.borrow_mut().prepare_ast(session);
                 }
+                session.sync_odoo.get_file_mgr().borrow_mut().touch_ast(&path);
                 let ast_type = file_info.borrow().file_info_ast.borrow().ast_type.clone();
                 match ast_type {
                     AstType::Python => {
@@ -1419,11 +1435,12 @@ impl Odoo {
         if uri.ends_with(".py") || uri.ends_with(".pyi") || uri.ends_with(".xml") || uri.ends_with(".csv") {
             if let Some(file_symbol) = SyncOdoo::get_symbol_of_opened_file(session, &PathBuf::from(path.clone())) {
                 let file_info = session.sync_odoo.get_file_mgr().borrow_mut().get_file_info(&path);
-                if let Some(file_info) = file_info {
-                    if file_info.borrow().file_info_ast.borrow().indexed_module.is_none() {
-                        file_info.borrow_mut().prepare_ast(session);
-                    }
-                    let ast_type = file_info.borrow().file_info_ast.borrow().ast_type.clone();
+            if let Some(file_info) = file_info {
+                if file_info.borrow().file_info_ast.borrow().indexed_module.is_none() {
+                    file_info.borrow_mut().prepare_ast(session);
+                }
+                session.sync_odoo.get_file_mgr().borrow_mut().touch_ast(&path);
+                let ast_type = file_info.borrow().file_info_ast.borrow().ast_type.clone();
                     match ast_type {
                         AstType::Python => {
                             if file_info.borrow_mut().file_info_ast.borrow().indexed_module.is_some() {
@@ -1473,6 +1490,7 @@ impl Odoo {
                 if schema != "untitled" && file_info.borrow().file_info_ast.borrow().indexed_module.is_none() {
                     file_info.borrow_mut().prepare_ast(session);
                 }
+                session.sync_odoo.get_file_mgr().borrow_mut().touch_ast(&path);
                 if file_info.borrow_mut().file_info_ast.borrow().indexed_module.is_some() {
                     if path.ends_with(".xml") {
                         return Ok(XmlCompletionFeature::autocomplete(session, &file_symbol, &file_info, params.text_document_position.position.line, params.text_document_position.position.character));
@@ -1874,6 +1892,7 @@ impl Odoo {
             if schema != "untitled" && file_info.borrow().file_info_ast.borrow().indexed_module.is_none() {
                 file_info.borrow_mut().prepare_ast(session);
             }
+            session.sync_odoo.get_file_mgr().borrow_mut().touch_ast(&path);
             return Ok(DocumentSymbolFeature::get_symbols(session, &file_info));
         }
         Ok(None)

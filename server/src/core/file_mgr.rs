@@ -3,7 +3,9 @@ use ruff_python_parser::{Parsed, Token, TokenKind};
 use lsp_types::{Diagnostic, DiagnosticSeverity, MessageType, NumberOrString, Position, PublishDiagnosticsParams, Range, TextDocumentContentChangeEvent};
 use lsp_types::notification::{Notification, PublishDiagnostics};
 use ruff_source_file::{OneIndexed, PositionEncoding, SourceLocation};
-use tracing::{error, warn};
+use tracing::{error, trace, warn};
+use lru::LruCache;
+use std::num::NonZeroUsize;
 use std::collections::hash_map::DefaultHasher;
 use std::collections::HashSet;
 use std::hash::{Hash, Hasher};
@@ -75,6 +77,15 @@ pub struct FileInfoAst {
 impl FileInfoAst {
     pub fn get_stmts(&self) -> Option<&Vec<Stmt>> {
         self.indexed_module.as_ref().map(|module| &module.parsed.syntax().body)
+    }
+
+    pub fn evict(&mut self) {
+        self.text_document = None;
+        self.indexed_module = None;
+    }
+
+    pub fn is_loaded(&self) -> bool {
+        self.text_document.is_some() || self.indexed_module.is_some()
     }
 }
 
@@ -238,6 +249,14 @@ impl FileInfo {
         self.file_info_ast.borrow().text_document.clone().unwrap().hash(&mut hasher);
         self.file_info_ast.borrow_mut().text_hash = hasher.finish();
         self._build_ast(session, session.sync_odoo.get_file_mgr().borrow().is_in_workspace(&self.uri));
+    }
+
+    pub fn evict_ast(&mut self) {
+        self.file_info_ast.borrow_mut().evict();
+    }
+
+    pub fn is_ast_loaded(&self) -> bool {
+        self.file_info_ast.borrow().is_loaded()
     }
 
     fn extract_tokens(&mut self, parsed_module: &Parsed<ModModule>, source: &String, encoding: PositionEncoding, parse_test_comments: bool) {
@@ -474,12 +493,15 @@ impl FileInfo {
     }
 }
 
+const AST_LRU_CACHE_CAPACITY: usize = 256;
+
 #[derive(Debug)]
 pub struct FileMgr {
     pub files: HashMap<String, Rc<RefCell<FileInfo>>>,
-    untitled_files: HashMap<String, Rc<RefCell<FileInfo>>>, // key: untitled URI or unique name
+    untitled_files: HashMap<String, Rc<RefCell<FileInfo>>>,
     workspace_folders: HashMap<String, String>,
     has_repeated_workspace_folders: bool,
+    ast_lru: LruCache<String, ()>,
 }
 
 impl FileMgr {
@@ -490,6 +512,7 @@ impl FileMgr {
             untitled_files: HashMap::new(),
             workspace_folders: HashMap::new(),
             has_repeated_workspace_folders: false,
+            ast_lru: LruCache::new(NonZeroUsize::new(AST_LRU_CACHE_CAPACITY).unwrap()),
         }
     }
 
@@ -684,6 +707,46 @@ impl FileMgr {
             }
         }
         false
+    }
+
+    pub fn touch_ast(&mut self, path: &str) {
+        if self.is_in_workspace(path) || Self::is_untitled(path) {
+            return;
+        }
+        
+        if self.ast_lru.contains(path) {
+            self.ast_lru.promote(path);
+            return;
+        }
+        
+        if let Some((evicted_path, _)) = self.ast_lru.push(path.to_string(), ()) {
+            if let Some(file_info) = self.files.get(&evicted_path) {
+                if !file_info.borrow().opened {
+                    trace!("Evicting AST for external file: {}", evicted_path);
+                    file_info.borrow_mut().evict_ast();
+                }
+            }
+        }
+    }
+
+    pub fn evict_all_external_asts(&mut self) {
+        let mut evicted_count = 0;
+        for (path, file_info) in self.files.iter() {
+            if !self.is_in_workspace(path) && !file_info.borrow().opened {
+                if file_info.borrow().is_ast_loaded() {
+                    file_info.borrow_mut().evict_ast();
+                    evicted_count += 1;
+                }
+            }
+        }
+        self.ast_lru.clear();
+        trace!("Evicted {} external file ASTs", evicted_count);
+    }
+
+    pub fn shrink_collections(&mut self) {
+        self.files.shrink_to_fit();
+        self.untitled_files.shrink_to_fit();
+        self.workspace_folders.shrink_to_fit();
     }
 
     pub fn pathname2uri(s: &String) -> lsp_types::Uri {
