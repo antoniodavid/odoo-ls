@@ -191,7 +191,7 @@ impl DefinitionFeature {
             let Some(symbol) = eval_ptr.upgrade_weak() else {
                 return  vec![];
             };
-            symbol.borrow().get_member_symbol(session, &S!("_compute_display_name"), maybe_module.clone(), false, false, true, true, false).0
+            Symbol::get_member_symbol(&symbol, session, &S!("_compute_display_name"), maybe_module.clone(), false, false, true, true, false).0
         }).collect::<Vec<_>>();
         for symbol in symbols {
             if let Some(file) = symbol.borrow().get_file() {
@@ -320,10 +320,7 @@ impl DefinitionFeature {
         });
         links.dedup_by(|a, b| {
             a.target_uri == b.target_uri && 
-            a.target_range.start.line == b.target_range.start.line &&
-            a.target_range.start.character == b.target_range.start.character &&
-            a.target_range.end.line == b.target_range.end.line &&
-            a.target_range.end.character == b.target_range.end.character
+            a.target_range.start.line == b.target_range.start.line
         });
         Some(GotoDefinitionResponse::Link(links))
     }

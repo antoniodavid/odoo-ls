@@ -745,7 +745,9 @@ impl Symbol {
             session.sync_odoo.touch_symbol(symbol);
             SyncOdoo::build_now(session, symbol, BuildSteps::ARCH);
             SyncOdoo::build_now(session, symbol, BuildSteps::ARCH_EVAL);
-            symbol.borrow_mut().set_loaded(true);
+            if let Ok(mut s) = symbol.try_borrow_mut() {
+                s.set_loaded(true);
+            }
         }
     }
 
@@ -778,6 +780,7 @@ impl Symbol {
             },
             Symbol::File(f) => {
                 f.loaded = false;
+                f.clear_cache();
                 f.symbols.values_mut().for_each(|sections| {
                     sections.values_mut().for_each(|syms| {
                         for sym in syms {
@@ -1245,7 +1248,12 @@ impl Symbol {
             Symbol::File(f) => {
                 match step {
                     BuildSteps::SYNTAX => panic!(),
-                    BuildSteps::ARCH => f.arch_status = status,
+                    BuildSteps::ARCH => {
+                        if status == BuildStatus::PENDING {
+                            f.clear_cache();
+                        }
+                        f.arch_status = status
+                    },
                     BuildSteps::ARCH_EVAL => f.arch_eval_status = status,
                     BuildSteps::VALIDATION => f.validation_status = status,
                 }
@@ -2281,7 +2289,7 @@ impl Symbol {
     pub fn next_refs(session: &mut SessionInfo, symbol_rc: Rc<RefCell<Symbol>>, context: &mut Option<Context>, symbol_context: &Context, stop_on_type: bool, diagnostics: &mut Vec<Diagnostic>) -> VecDeque<EvaluationSymbolPtr> {
         //if current symbol is a descriptor, we have to resolve __get__ method before going further
         let mut res = VecDeque::new();
-        let symbol = &*symbol_rc.borrow();
+        // let symbol = &*symbol_rc.borrow(); // Removed borrow
         if !stop_on_type {
             let mut base_attr = symbol_context.get(&S!("base_attr"));
             if base_attr.is_none() {
@@ -2293,9 +2301,9 @@ impl Symbol {
             if let Some(base_attr) = base_attr {
                 let base_attr = base_attr.as_symbol().upgrade();
                 if let Some(base_attr) = base_attr {
-                    let attribute_type_sym = symbol;
+                    // let attribute_type_sym = symbol; // Removed borrow usage
                     //TODO shouldn't we set the from_module in the call to get_member_symbol?
-                    let get_method = attribute_type_sym.get_member_symbol(session, &S!("__get__"), None, true, false, false, true, false).0.first().cloned();
+                    let get_method = Symbol::get_member_symbol(&symbol_rc, session, &S!("__get__"), None, true, false, false, true, false).0.first().cloned();
                     match get_method {
                         Some(get_method) if (base_attr.borrow().typ() == SymType::CLASS) => {
                             let get_method = get_method.borrow();
@@ -2332,7 +2340,8 @@ impl Symbol {
                 }
             }
         }
-        if let Symbol::Variable(v) = symbol {
+        let symbol = symbol_rc.borrow();
+        if let Symbol::Variable(v) = &*symbol {
             for eval in v.evaluations.iter() {
                 let ctx = &mut Some(symbol_context.clone().into_iter().chain(context.clone().unwrap_or(HashMap::new()).into_iter()).collect::<HashMap<_, _>>());
                 let mut sym = eval.symbol.get_symbol(session, ctx, diagnostics, None);
@@ -2950,7 +2959,7 @@ impl Symbol {
     is the one that is overriding others.
     :param: from_module: optional, can change the from_module of the given class */
     pub fn get_member_symbol(
-        &self,
+        symbol: &Rc<RefCell<Symbol>>,
         session: &mut SessionInfo,
         name: &String,
         from_module: Option<Rc<RefCell<Symbol>>>,
@@ -2960,12 +2969,15 @@ impl Symbol {
         all: bool,
         is_super: bool
     ) -> (Vec<Rc<RefCell<Symbol>>>, Vec<Diagnostic>) {
+        if symbol.borrow().is_external() && !symbol.borrow().is_loaded() {
+             Symbol::ensure_loaded(symbol, session);
+        }
         let mut visited_classes: PtrWeakHashSet<Weak<RefCell<Symbol>>> = PtrWeakHashSet::new();
-        return self._get_member_symbol_helper(session, name, from_module, prevent_comodel, only_fields, only_methods, all, is_super, &mut visited_classes);
+        return Symbol::_get_member_symbol_helper(symbol, session, name, from_module, prevent_comodel, only_fields, only_methods, all, is_super, &mut visited_classes);
     }
 
     fn _get_member_symbol_helper(
-        &self,
+        symbol: &Rc<RefCell<Symbol>>,
         session: &mut SessionInfo,
         name: &String,
         from_module: Option<Rc<RefCell<Symbol>>>,
@@ -2976,6 +2988,7 @@ impl Symbol {
         is_super: bool,
         visited_classes: &mut PtrWeakHashSet<Weak<RefCell<Symbol>>>
     ) -> (Vec<Rc<RefCell<Symbol>>>, Vec<Diagnostic>) {
+        let self_ = symbol.borrow();
         let mut result: Vec<Rc<RefCell<Symbol>>> = vec![];
         let mut visited_symbols: PtrWeakHashSet<Weak<RefCell<Symbol>>> = PtrWeakHashSet::new();
         let extend_result = |syms: Vec<Rc<RefCell<Symbol>>>, result: &mut Vec<Rc<RefCell<Symbol>>>, visited_symbols: &mut PtrWeakHashSet<Weak<RefCell<Symbol>>>| {
@@ -2987,8 +3000,8 @@ impl Symbol {
             });
         };
         let mut diagnostics: Vec<Diagnostic> = vec![];
-        self.member_symbol_hook(session, name, &mut diagnostics);
-        let mod_sym = self.get_module_symbol(name);
+        self_.member_symbol_hook(session, name, &mut diagnostics);
+        let mod_sym = self_.get_module_symbol(name);
         if let Some(mod_sym) = mod_sym {
             if !only_fields {
                 if all {
@@ -2999,7 +3012,7 @@ impl Symbol {
             }
         }
         if !is_super{
-            let mut content_syms = self.get_sub_symbol(name, u32::MAX).symbols;
+            let mut content_syms = self_.get_sub_symbol(name, u32::MAX).symbols;
             if only_fields {
                 content_syms = content_syms.iter().filter(|x| x.borrow().is_field(session)).cloned().collect();
             }
@@ -3014,21 +3027,21 @@ impl Symbol {
                 }
             }
         }
-        if self.typ() == SymType::CLASS && self.as_class_sym()._model.is_some() && !prevent_comodel {
-            let model = session.sync_odoo.models.get(&self.as_class_sym()._model.as_ref().unwrap().name).cloned();
+        if self_.typ() == SymType::CLASS && self_.as_class_sym()._model.is_some() && !prevent_comodel {
+            let model = session.sync_odoo.models.get(&self_.as_class_sym()._model.as_ref().unwrap().name).cloned();
             if let Some(model) = model {
                 let mut from_module = from_module.clone();
                 if from_module.is_none() {
-                    from_module = self.find_module();
+                    from_module = self_.find_module();
                 }
                 if let Some(from_module) = from_module {
                     let model_symbols = Model::get_full_model_symbols(model.clone(), session, from_module.clone());
                     for model_symbol in model_symbols {
-                        if self.is_equal(&model_symbol) || visited_classes.contains(&model_symbol){
+                        if self_.is_equal(&model_symbol) || visited_classes.contains(&model_symbol){
                             continue;
                         }
                         visited_classes.insert(model_symbol.clone());
-                        let (attributs, att_diagnostic) = model_symbol.borrow()._get_member_symbol_helper(session, name, None, true, only_fields, only_methods, all, false, visited_classes);
+                        let (attributs, att_diagnostic) = Symbol::_get_member_symbol_helper(&model_symbol, session, name, None, true, only_fields, only_methods, all, false, visited_classes);
                         diagnostics.extend(att_diagnostic);
                         if all {
                             extend_result(attributs, &mut result, &mut visited_symbols);
@@ -3042,11 +3055,11 @@ impl Symbol {
                         //only fields are visible on inherits, not methods
                         let model_symbols = Model::get_full_model_symbols(model_inherits_symbol, session, from_module.clone());
                         for model_symbol in model_symbols {
-                            if self.is_equal(&model_symbol) || visited_classes.contains(&model_symbol){
+                            if self_.is_equal(&model_symbol) || visited_classes.contains(&model_symbol){
                                 continue;
                             }
                             visited_classes.insert(model_symbol.clone());
-                            let (attributs, att_diagnostic) = model_symbol.borrow()._get_member_symbol_helper(session, name, None, true, true, only_methods, all, false, visited_classes);
+                            let (attributs, att_diagnostic) = Symbol::_get_member_symbol_helper(&model_symbol, session, name, None, true, true, only_methods, all, false, visited_classes);
                             diagnostics.extend(att_diagnostic);
                             if all {
                                 extend_result(attributs, &mut result, &mut visited_symbols);
@@ -3060,8 +3073,8 @@ impl Symbol {
                 }
             }
         }
-        if self.typ() == SymType::CLASS && result.is_empty() { // if we already have something, do not go up in bases
-            for base in self.as_class_sym().bases.iter() {
+        if self_.typ() == SymType::CLASS && result.is_empty() { // if we already have something, do not go up in bases
+            for base in self_.as_class_sym().bases.iter() {
                 let base = match base.upgrade(){
                     Some(b) => b,
                     None => continue
@@ -3070,7 +3083,7 @@ impl Symbol {
                     continue;
                 }
                 visited_classes.insert(base.clone());
-                let (s, s_diagnostic) = base.borrow().get_member_symbol(session, name, from_module.clone(), prevent_comodel, only_fields, only_methods, all, false);
+                let (s, s_diagnostic) = Symbol::get_member_symbol(&base, session, name, from_module.clone(), prevent_comodel, only_fields, only_methods, all, false);
                     diagnostics.extend(s_diagnostic);
                 if !s.is_empty() {
                     if all {

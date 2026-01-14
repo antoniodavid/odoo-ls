@@ -62,7 +62,13 @@ impl PythonArchBuilder {
         if [SymType::NAMESPACE, SymType::ROOT, SymType::COMPILED, SymType::VARIABLE, SymType::CLASS].contains(&symbol.borrow().typ()) {
             return; // nothing to extract
         }
-        self.reuse_pool = symbol.borrow_mut().harvest_symbols();
+        
+        let Ok(mut symbol_borrow) = symbol.try_borrow_mut() else {
+            warn!("Cannot borrow symbol {} mutably in load_arch. Skipping load.", symbol.borrow().name());
+            return;
+        };
+        self.reuse_pool = symbol_borrow.harvest_symbols();
+        drop(symbol_borrow);
 
         {
             let file = symbol.borrow();

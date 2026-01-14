@@ -1,7 +1,8 @@
 use weak_table::{PtrWeakHashSet, PtrWeakKeyHashMap};
 
-use crate::{constants::{BuildStatus, BuildSteps, OYarn}, core::{file_mgr::NoqaInfo, model::Model, xml_data::OdooData}, oyarn};
+use crate::{constants::{BuildStatus, BuildSteps, OYarn}, core::{evaluation::Evaluation, file_mgr::NoqaInfo, model::Model, xml_data::OdooData}, oyarn};
 use std::{cell::RefCell, collections::HashMap, rc::{Rc, Weak}};
+use ruff_text_size::TextRange;
 
 use super::{symbol::Symbol, symbol_mgr::{SectionRange, SymbolMgr}};
 
@@ -26,6 +27,7 @@ pub struct FileSymbol {
     pub processed_text_hash: u64,
     pub noqas: NoqaInfo,
     pub loaded: bool,
+    pub ast_eval_cache: HashMap<TextRange, Vec<Evaluation>>,
 
     //Trait SymbolMgr
     pub sections: Vec<SectionRange>,
@@ -62,6 +64,7 @@ impl FileSymbol {
             not_found_models: HashMap::new(),
             noqas: NoqaInfo::None,
             loaded: false,
+            ast_eval_cache: HashMap::new(),
         };
         res._init_symbol_mgr();
         res
@@ -169,6 +172,10 @@ impl FileSymbol {
             }
         }
         result
+    }
+
+    pub fn clear_cache(&mut self) {
+        self.ast_eval_cache.clear();
     }
 
 }

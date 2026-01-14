@@ -1,8 +1,9 @@
 use std::{cell::RefCell, rc::Rc};
-use lsp_types::{CompletionItem, CompletionItemKind, CompletionList, CompletionResponse};
+use lsp_types::{CompletionItem, CompletionItemKind, CompletionItemLabelDetails, CompletionList, CompletionResponse};
 
 use crate::{
     core::{
+        evaluation::Context,
         file_mgr::FileInfo,
         symbols::symbol::Symbol,
     },
@@ -11,6 +12,67 @@ use crate::{
 };
 
 pub struct XmlCompletionFeature;
+
+/// Helper function to extract field type from a field symbol.
+/// Returns a string like "Integer", "Float", "(res.users) Many2one", etc.
+fn get_field_type(session: &mut SessionInfo, symbol: &Rc<RefCell<Symbol>>) -> Option<String> {
+    let sym_ref = symbol.borrow();
+
+    if sym_ref.typ() != crate::constants::SymType::VARIABLE {
+        return None;
+    }
+
+    let parent_context = sym_ref.parent().and_then(|parent| parent.upgrade());
+    let evals_option = sym_ref.evaluations().cloned();
+
+    drop(sym_ref);
+
+    let Some(evals) = evals_option else {
+        return None;
+    };
+
+    for eval in evals.iter() {
+        let eval_symbol = eval.symbol.get_symbol(session, &mut None, &mut vec![], None);
+
+        let mut context = None;
+        if let Some(parent) = &parent_context {
+            context = Some(Context::new());
+            context.as_mut().unwrap().insert(
+                crate::oyarn!("base_attr").to_string(),
+                crate::core::evaluation::ContextValue::SYMBOL(Rc::downgrade(parent)),
+            );
+        }
+
+        let eval_weaks = crate::core::symbols::symbol::Symbol::follow_ref(
+            &eval_symbol,
+            session,
+            &mut context,
+            true,
+            false,
+            None,
+        );
+
+        for eval_weak in eval_weaks.iter() {
+            if let Some(field_class) = eval_weak.upgrade_weak() {
+                if field_class.borrow().is_field_class(session) {
+                    let field_type = field_class.borrow().name().to_string();
+
+                    // For relational fields, show comodel name if available
+                    if ["Many2one", "One2many", "Many2many"].contains(&field_type.as_str()) {
+                        if let Some(comodel_value) = eval_weak.as_weak().context.get("comodel_name") {
+                            let comodel = comodel_value.as_string();
+                            return Some(format!("({}) {}", comodel, field_type));
+                        }
+                    }
+
+                    return Some(field_type);
+                }
+            }
+        }
+    }
+
+    None
+}
 
 impl XmlCompletionFeature {
     pub fn autocomplete(
@@ -63,14 +125,25 @@ impl XmlCompletionFeature {
             match result {
                 XmlAstResult::SYMBOL(sym) => {
                     let sym_ref = sym.borrow();
+                    let label = sym_ref.name().to_string();
+                    let field_type = get_field_type(session, &sym);
+
                     items.push(CompletionItem {
-                        label: sym_ref.name().to_string(),
+                        label: label.clone(),
                         kind: Some(match sym_ref.typ() {
                             crate::constants::SymType::CLASS => CompletionItemKind::CLASS,
                             crate::constants::SymType::VARIABLE => CompletionItemKind::FIELD,
                             _ => CompletionItemKind::TEXT,
                         }),
-                        detail: Some(format!("{:?}", sym_ref.typ())), // Simple detail for now
+                        label_details: if field_type.is_some() {
+                            Some(CompletionItemLabelDetails {
+                                detail: None,
+                                description: field_type,
+                            })
+                        } else {
+                            None
+                        },
+                        detail: None,
                         ..Default::default()
                     });
                 }

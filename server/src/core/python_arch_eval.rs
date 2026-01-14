@@ -829,9 +829,9 @@ impl PythonArchEval {
                 let symbol_eval = Symbol::follow_ref(&eval_symbol, session, &mut None, false, false, None);
                 if symbol_eval.len() == 1 && symbol_eval[0].upgrade_weak().is_some() {
                     let symbol_type_rc = symbol_eval[0].upgrade_weak().unwrap();
-                    let symbol_type = symbol_type_rc.borrow();
-                    if symbol_type.typ() == SymType::CLASS {
-                        let (iter, _) = symbol_type.get_member_symbol(session, &S!("__iter__"), None, true, false, false, false, false);
+                    let is_class = symbol_type_rc.borrow().typ() == SymType::CLASS;
+                    if is_class {
+                        let (iter, _) = Symbol::get_member_symbol(&symbol_type_rc, session, &S!("__iter__"), None, true, false, false, false, false);
                         if iter.len() == 1 {
                             if !iter[0].borrow().is_external() { //we can't rebuild functions of external files
                                 SyncOdoo::build_now(session, &iter[0], BuildSteps::ARCH);
@@ -1053,13 +1053,13 @@ impl PythonArchEval {
         from_module: Option<Rc<RefCell<Symbol>>>,
     ) -> Vec<Rc<RefCell<Symbol>>>{
         let mut parent_object = Some(class_sym);
-        let mut syms = vec![];
+        let mut syms: Vec<Rc<RefCell<Symbol>>> = vec![];
         let split_expr: Vec<String> = field_name.split(".").map(|x| x.to_string()).collect();
         for (ix, name) in split_expr.iter().enumerate() {
             if parent_object.is_none() {
                 break;
             }
-            let (symbols, _diagnostics) = parent_object.clone().unwrap().borrow().get_member_symbol(session,
+            let (symbols, _diagnostics) = Symbol::get_member_symbol(&parent_object.clone().unwrap(), session,
                 &name.to_string(),
                 from_module.clone(),
                 false,

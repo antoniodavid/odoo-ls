@@ -202,8 +202,8 @@ impl PythonOdooBuilder {
         }
     }
 
-    fn _get_attribute(session: &mut SessionInfo, loc_sym: &mut Symbol, attr: &String, diagnostics: &mut Vec<Diagnostic>) -> Option<EvaluationValue> {
-        let (attr_sym, _) = loc_sym.get_member_symbol(session, attr, None, true, false, false, false, false);
+    fn _get_attribute(session: &mut SessionInfo, loc_sym: &Rc<RefCell<Symbol>>, attr: &String, diagnostics: &mut Vec<Diagnostic>) -> Option<EvaluationValue> {
+        let (attr_sym, _) = Symbol::get_member_symbol(loc_sym, session, attr, None, true, false, false, false, false);
         if attr_sym.len() == 0 {
             return None;
         }
@@ -218,91 +218,94 @@ impl PythonOdooBuilder {
     }
 
     fn _load_class_attributes(&mut self, session: &mut SessionInfo, diagnostics: &mut Vec<Diagnostic>) {
-        let mut symbol = self.symbol.borrow_mut();
-        let descr = PythonOdooBuilder::_get_attribute(session, &mut symbol, &"_description".to_string(), diagnostics);
+        let descr = PythonOdooBuilder::_get_attribute(session, &self.symbol, &"_description".to_string(), diagnostics);
         if let Some(EvaluationValue::CONSTANT(Expr::StringLiteral(s))) = descr {
-            symbol.as_class_sym_mut()._model.as_mut().unwrap().description = S!(s.value.to_str());
+            self.symbol.borrow_mut().as_class_sym_mut()._model.as_mut().unwrap().description = S!(s.value.to_str());
         } else {
-            symbol.as_class_sym_mut()._model.as_mut().unwrap().description = symbol.as_class_sym()._model.as_ref().unwrap().name.to_string();
+            let name = self.symbol.borrow().as_class_sym()._model.as_ref().unwrap().name.to_string();
+            self.symbol.borrow_mut().as_class_sym_mut()._model.as_mut().unwrap().description = name;
         }
-        let auto = PythonOdooBuilder::_get_attribute(session, &mut symbol, &"_auto".to_string(), diagnostics);
+        let auto = PythonOdooBuilder::_get_attribute(session, &self.symbol, &"_auto".to_string(), diagnostics);
         if let Some(EvaluationValue::CONSTANT(Expr::BooleanLiteral(b))) = auto {
-            symbol.as_class_sym_mut()._model.as_mut().unwrap().auto = b.value;
+            self.symbol.borrow_mut().as_class_sym_mut()._model.as_mut().unwrap().auto = b.value;
         } else {
-            symbol.as_class_sym_mut()._model.as_mut().unwrap().auto = false;
+            self.symbol.borrow_mut().as_class_sym_mut()._model.as_mut().unwrap().auto = false;
         }
-        let log_access = PythonOdooBuilder::_get_attribute(session, &mut symbol, &"_log_access".to_string(), diagnostics);
+        let log_access = PythonOdooBuilder::_get_attribute(session, &self.symbol, &"_log_access".to_string(), diagnostics);
         if let Some(EvaluationValue::CONSTANT(Expr::BooleanLiteral(b))) = log_access {
-            symbol.as_class_sym_mut()._model.as_mut().unwrap().log_access = b.value;
+            self.symbol.borrow_mut().as_class_sym_mut()._model.as_mut().unwrap().log_access = b.value;
         } else {
-            symbol.as_class_sym_mut()._model.as_mut().unwrap().log_access = symbol.as_class_sym()._model.as_ref().unwrap().auto;
+            let auto = self.symbol.borrow().as_class_sym()._model.as_ref().unwrap().auto;
+            self.symbol.borrow_mut().as_class_sym_mut()._model.as_mut().unwrap().log_access = auto;
         }
-        let table = PythonOdooBuilder::_get_attribute(session, &mut symbol, &"_table".to_string(), diagnostics);
+        let table = PythonOdooBuilder::_get_attribute(session, &self.symbol, &"_table".to_string(), diagnostics);
         if let Some(EvaluationValue::CONSTANT(Expr::StringLiteral(s))) = table {
-            symbol.as_class_sym_mut()._model.as_mut().unwrap().table = S!(s.value.to_str());
+            self.symbol.borrow_mut().as_class_sym_mut()._model.as_mut().unwrap().table = S!(s.value.to_str());
         } else {
-            symbol.as_class_sym_mut()._model.as_mut().unwrap().table = symbol.as_class_sym()._model.as_ref().unwrap().name.clone().replace(".", "_");
+            let name = self.symbol.borrow().as_class_sym()._model.as_ref().unwrap().name.clone().replace(".", "_");
+            self.symbol.borrow_mut().as_class_sym_mut()._model.as_mut().unwrap().table = name;
         }
-        let sequence = PythonOdooBuilder::_get_attribute(session, &mut symbol, &"_sequence".to_string(), diagnostics);
+        let sequence = PythonOdooBuilder::_get_attribute(session, &self.symbol, &"_sequence".to_string(), diagnostics);
         if let Some(EvaluationValue::CONSTANT(Expr::StringLiteral(s))) = sequence {
-            symbol.as_class_sym_mut()._model.as_mut().unwrap().sequence = S!(s.value.to_str());
+            self.symbol.borrow_mut().as_class_sym_mut()._model.as_mut().unwrap().sequence = S!(s.value.to_str());
         } else {
-            symbol.as_class_sym_mut()._model.as_mut().unwrap().sequence = symbol.as_class_sym()._model.as_ref().unwrap().table.clone() + "_id_seq";
+            let table = self.symbol.borrow().as_class_sym()._model.as_ref().unwrap().table.clone();
+            self.symbol.borrow_mut().as_class_sym_mut()._model.as_mut().unwrap().sequence = table + "_id_seq";
         }
-        let is_abstract = PythonOdooBuilder::_get_attribute(session, &mut symbol, &"_abstract".to_string(), diagnostics);
+        let is_abstract = PythonOdooBuilder::_get_attribute(session, &self.symbol, &"_abstract".to_string(), diagnostics);
         if let Some(EvaluationValue::CONSTANT(Expr::BooleanLiteral(b))) = is_abstract {
-            symbol.as_class_sym_mut()._model.as_mut().unwrap().is_abstract = b.value;
+            self.symbol.borrow_mut().as_class_sym_mut()._model.as_mut().unwrap().is_abstract = b.value;
         } else {
-            symbol.as_class_sym_mut()._model.as_mut().unwrap().is_abstract = true;
+            self.symbol.borrow_mut().as_class_sym_mut()._model.as_mut().unwrap().is_abstract = true;
         }
-        let transient = PythonOdooBuilder::_get_attribute(session, &mut symbol, &"_transient".to_string(), diagnostics);
+        let transient = PythonOdooBuilder::_get_attribute(session, &self.symbol, &"_transient".to_string(), diagnostics);
         if let Some(EvaluationValue::CONSTANT(Expr::BooleanLiteral(b))) = transient {
-            symbol.as_class_sym_mut()._model.as_mut().unwrap().transient = b.value;
+            self.symbol.borrow_mut().as_class_sym_mut()._model.as_mut().unwrap().transient = b.value;
         } else {
-            symbol.as_class_sym_mut()._model.as_mut().unwrap().transient = false;
+            self.symbol.borrow_mut().as_class_sym_mut()._model.as_mut().unwrap().transient = false;
         }
-        let rec_name = PythonOdooBuilder::_get_attribute(session, &mut symbol, &"_rec_name".to_string(), diagnostics);
+        let rec_name = PythonOdooBuilder::_get_attribute(session, &self.symbol, &"_rec_name".to_string(), diagnostics);
         //TODO check that rec_name is a field
         if let Some(EvaluationValue::CONSTANT(Expr::StringLiteral(s))) = rec_name {
-            symbol.as_class_sym_mut()._model.as_mut().unwrap().rec_name = Some(S!(s.value.to_str()));
+            self.symbol.borrow_mut().as_class_sym_mut()._model.as_mut().unwrap().rec_name = Some(S!(s.value.to_str()));
         } else {
-            symbol.as_class_sym_mut()._model.as_mut().unwrap().rec_name = Some(S!("name")); //TODO if name is not on model, take 'id'
+            self.symbol.borrow_mut().as_class_sym_mut()._model.as_mut().unwrap().rec_name = Some(S!("name")); //TODO if name is not on model, take 'id'
         }
-        let _check_company_auto = PythonOdooBuilder::_get_attribute(session, &mut symbol, &"_check_company_auto".to_string(), diagnostics);
+        let _check_company_auto = PythonOdooBuilder::_get_attribute(session, &self.symbol, &"_check_company_auto".to_string(), diagnostics);
         if let Some(EvaluationValue::CONSTANT(Expr::BooleanLiteral(b))) = _check_company_auto {
-            symbol.as_class_sym_mut()._model.as_mut().unwrap().check_company_auto = b.value;
+            self.symbol.borrow_mut().as_class_sym_mut()._model.as_mut().unwrap().check_company_auto = b.value;
         } else {
-            symbol.as_class_sym_mut()._model.as_mut().unwrap().check_company_auto = false;
+            self.symbol.borrow_mut().as_class_sym_mut()._model.as_mut().unwrap().check_company_auto = false;
         }
-        let parent_name = PythonOdooBuilder::_get_attribute(session, &mut symbol, &"_parent_name".to_string(), diagnostics);
+        let parent_name = PythonOdooBuilder::_get_attribute(session, &self.symbol, &"_parent_name".to_string(), diagnostics);
         if let Some(EvaluationValue::CONSTANT(Expr::StringLiteral(s))) = parent_name {
-            symbol.as_class_sym_mut()._model.as_mut().unwrap().parent_name = S!(s.value.to_str());
+            self.symbol.borrow_mut().as_class_sym_mut()._model.as_mut().unwrap().parent_name = S!(s.value.to_str());
         } else {
-            symbol.as_class_sym_mut()._model.as_mut().unwrap().parent_name = S!("parent_id");
+            self.symbol.borrow_mut().as_class_sym_mut()._model.as_mut().unwrap().parent_name = S!("parent_id");
         }
-        let parent_store = PythonOdooBuilder::_get_attribute(session, &mut symbol, &"_parent_store".to_string(), diagnostics);
+        let parent_store = PythonOdooBuilder::_get_attribute(session, &self.symbol, &"_parent_store".to_string(), diagnostics);
         if let Some(EvaluationValue::CONSTANT(Expr::BooleanLiteral(b))) = parent_store {
-            symbol.as_class_sym_mut()._model.as_mut().unwrap().parent_store = b.value;
+            self.symbol.borrow_mut().as_class_sym_mut()._model.as_mut().unwrap().parent_store = b.value;
         } else {
-            symbol.as_class_sym_mut()._model.as_mut().unwrap().parent_store = false;
+            self.symbol.borrow_mut().as_class_sym_mut()._model.as_mut().unwrap().parent_store = false;
         }
-        let active_name = PythonOdooBuilder::_get_attribute(session, &mut symbol, &"_active_name".to_string(), diagnostics);
+        let active_name = PythonOdooBuilder::_get_attribute(session, &self.symbol, &"_active_name".to_string(), diagnostics);
         if let Some(EvaluationValue::CONSTANT(Expr::StringLiteral(s))) = active_name {
-            symbol.as_class_sym_mut()._model.as_mut().unwrap().active_name = Some(S!(s.value.to_str()));
+            self.symbol.borrow_mut().as_class_sym_mut()._model.as_mut().unwrap().active_name = Some(S!(s.value.to_str()));
         } else {
-            symbol.as_class_sym_mut()._model.as_mut().unwrap().active_name = None;
+            self.symbol.borrow_mut().as_class_sym_mut()._model.as_mut().unwrap().active_name = None;
         }
-        let data_name = PythonOdooBuilder::_get_attribute(session, &mut symbol, &"_data_name".to_string(), diagnostics);
+        let data_name = PythonOdooBuilder::_get_attribute(session, &self.symbol, &"_data_name".to_string(), diagnostics);
         if let Some(EvaluationValue::CONSTANT(Expr::StringLiteral(s))) = data_name {
-            symbol.as_class_sym_mut()._model.as_mut().unwrap().data_name = S!(s.value.to_str());
+            self.symbol.borrow_mut().as_class_sym_mut()._model.as_mut().unwrap().data_name = S!(s.value.to_str());
         } else {
-            symbol.as_class_sym_mut()._model.as_mut().unwrap().data_name = S!("date");
+            self.symbol.borrow_mut().as_class_sym_mut()._model.as_mut().unwrap().data_name = S!("date");
         }
-        let fold_name = PythonOdooBuilder::_get_attribute(session, &mut symbol, &"_fold_name".to_string(), diagnostics);
+        let fold_name = PythonOdooBuilder::_get_attribute(session, &self.symbol, &"_fold_name".to_string(), diagnostics);
         if let Some(EvaluationValue::CONSTANT(Expr::StringLiteral(s))) = fold_name {
-            symbol.as_class_sym_mut()._model.as_mut().unwrap().fold_name = S!(s.value.to_str());
+            self.symbol.borrow_mut().as_class_sym_mut()._model.as_mut().unwrap().fold_name = S!(s.value.to_str());
         } else {
-            symbol.as_class_sym_mut()._model.as_mut().unwrap().fold_name = S!("fold");
+            self.symbol.borrow_mut().as_class_sym_mut()._model.as_mut().unwrap().fold_name = S!("fold");
         }
     }
 

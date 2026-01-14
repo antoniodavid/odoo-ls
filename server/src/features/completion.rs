@@ -1016,35 +1016,35 @@ fn add_nested_field_names(
         if obj.is_none() {
             break;
         }
-        if let Some(object) = &obj {
-            if index == split_expr.len() - 1 {
-                let all_symbols = Symbol::all_members(&object, session,  true, true, false, from_module.clone(), false);
-                for (_symbol_name, symbols) in all_symbols {
-                    //we could use symbol_name to remove duplicated names, but it would hide functions vs variables
-                    if _symbol_name.starts_with(name) {
-                        let mut found_one = false;
-                        for (final_sym, dep) in symbols.iter() { //search for at least one that is a field
-                            if dep.is_none() && (specific_field_type.is_none() || final_sym.borrow().is_specific_field(session, &["Many2one", "One2many", "Many2many", specific_field_type.as_ref().unwrap().as_str()])){
-                                items.push(build_completion_item_from_symbol(session, vec![final_sym.clone()], HashMap::new()));
-                                found_one = true;
-                                continue;
-                            }
-                        }
-                        if found_one {
-                            continue;
-                        }
-                    }
-                }
-            } else {
-                let (symbols, _diagnostics) = object.borrow().get_member_symbol(session,
-                    &name.to_string(),
-                    from_module.clone(),
-                    false,
-                    true,
-                    false,
-                    true,
-                    false);
-                if symbols.is_empty() {
+                        if let Some(object) = &obj {
+                            if index == split_expr.len() - 1 {
+                                let all_symbols = Symbol::all_members(&object, session,  true, true, false, from_module.clone(), false);
+                                for (_symbol_name, symbols) in all_symbols {
+                                    //we could use symbol_name to remove duplicated names, but it would hide functions vs variables
+                                    if _symbol_name.starts_with(name) {
+                                        let mut found_one = false;
+                                        for (final_sym, dep) in symbols.iter() { //search for at least one that is a field
+                                            if dep.is_none() && (specific_field_type.is_none() || final_sym.borrow().is_specific_field(session, &["Many2one", "One2many", "Many2many", specific_field_type.as_ref().unwrap().as_str()])){
+                                                items.push(build_completion_item_from_symbol(session, vec![final_sym.clone()], HashMap::new()));
+                                                found_one = true;
+                                                continue;
+                                            }
+                                        }
+                                        if found_one {
+                                            continue;
+                                        }
+                                    }
+                                }
+                            } else {
+                                let (symbols, _diagnostics) = Symbol::get_member_symbol(&object, session,
+                                    &name.to_string(),
+                                    from_module.clone(),
+                                    false,
+                                    true,
+                                    false,
+                                    true,
+                                    false);
+                                if symbols.is_empty() {
                     break;
                 }
                 obj = None;

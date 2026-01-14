@@ -427,9 +427,7 @@ impl PythonValidator {
                                 }
                                 break 'related_check;
                             }
-                            let Some(field_type) = symbol
-                                .borrow()
-                                .get_member_symbol(session, &S!("type"), None, false, false, false, false, false)
+                            let Some(field_type) = Symbol::get_member_symbol(&symbol, session, &S!("type"), None, false, false, false, false, false)
                                 .0.first()
                                 .and_then(|field_type_var| field_type_var.borrow().evaluations().cloned())
                                 .and_then(|evals| evals.first().cloned())
@@ -450,9 +448,7 @@ impl PythonValidator {
                                     let Some(related_field_class_sym) = related_eval_weak.upgrade_weak() else {
                                         return false
                                     };
-                                    let found = related_field_class_sym
-                                        .borrow()
-                                        .get_member_symbol(session, &S!("type"), None, false, false, false, false, false)
+                                    let found = Symbol::get_member_symbol(&related_field_class_sym, session, &S!("type"), None, false, false, false, false, false)
                                         .0.first()
                                         .and_then(|field_type_var| field_type_var.borrow().evaluations().cloned())
                                         .and_then(|evals| evals.first().cloned())
@@ -515,7 +511,7 @@ impl PythonValidator {
                         let Some(module) = class_ref.find_module() else {
                             continue;
                         };
-                        let (symbols, _diagnostics) = class.clone().borrow().get_member_symbol(session,
+                        let (symbols, _diagnostics) = Symbol::get_member_symbol(&class, session,
                             &method_name.to_string(),
                             Some(module.clone()),
                             false,
@@ -550,7 +546,7 @@ impl PythonValidator {
                         };
                         let main_syms = model.borrow().get_main_symbols(session, Some(module.clone()));
                         let symbols: Vec<_> = main_syms.iter().flat_map(|main_sym|
-                            main_sym.clone().borrow().get_member_symbol(session, &inverse_name, Some(module.clone()), false, true, false, true, false).0
+                            Symbol::get_member_symbol(&main_sym, session, &inverse_name, Some(module.clone()), false, true, false, true, false).0
                         ).collect();
                         if symbols.is_empty() {
                             let Some(arg_range) = eval_weak.as_weak().context.get(&format!("inverse_name_arg_range")).map(|ctx_val| ctx_val.as_text_range()) else {

@@ -84,7 +84,7 @@ impl FeaturesUtils {
         ) {
             return vec![];
         }
-        parent_class.clone().borrow().get_member_symbol(session, field_value, from_module.clone(), false, false, true, true, false).0
+        Symbol::get_member_symbol(&parent_class, session, field_value, from_module.clone(), false, false, true, true, false).0
     }
 
     fn find_inverse_name_field_symbol(
@@ -109,7 +109,7 @@ impl FeaturesUtils {
             return vec![];
         };
         let main_syms = model.borrow().get_main_symbols(session, from_module.clone());
-        main_syms.iter().flat_map(|main_sym| main_sym.clone().borrow().get_member_symbol(session, field_value, from_module.clone(), false, true, false, true, false).0).collect()
+        main_syms.iter().flat_map(|main_sym| Symbol::get_member_symbol(&main_sym, session, field_value, from_module.clone(), false, true, false, true, false).0).collect()
     }
 
     fn find_simple_decorator_field_symbol(
@@ -124,7 +124,7 @@ impl FeaturesUtils {
         if parent_class.borrow().as_class_sym()._model.is_none(){
             return vec![];
         }
-        parent_class.clone().borrow().get_member_symbol(session, field_name, from_module.clone(), false, true, false, true, false).0
+        Symbol::get_member_symbol(&parent_class, session, field_name, from_module.clone(), false, true, false, true, false).0
     }
 
     fn find_nested_fields(
@@ -147,10 +147,10 @@ impl FeaturesUtils {
             let range_end = range_start + TextSize::new((name.len() + 1) as u32);
             let cursor_section = TextRange::new(range_start, range_end).contains(TextSize::new(*offset as u32));
             if cursor_section {
-                let fields = parent_object.clone().unwrap().borrow().get_member_symbol(session, &name, from_module.clone(), false, true, false, true, false).0;
+                let fields = Symbol::get_member_symbol(&parent_object.clone().unwrap(), session, &name, from_module.clone(), false, true, false, true, false).0;
                 return fields.into_iter().map(|f| (f, TextRange::new(range_start, range_end - TextSize::new(1)))).collect();
             } else {
-                let (symbols, _diagnostics) = parent_object.clone().unwrap().borrow().get_member_symbol(session,
+                let (symbols, _diagnostics) = Symbol::get_member_symbol(&parent_object.clone().unwrap(), session,
                     &name.to_string(),
                     from_module.clone(),
                     false,

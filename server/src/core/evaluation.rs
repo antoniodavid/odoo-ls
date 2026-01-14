@@ -577,6 +577,18 @@ impl Evaluation {
     * not build but required during the eval_from_ast, it will NOT be built
     */
     pub fn eval_from_ast(session: &mut SessionInfo, ast: &Expr, parent: Rc<RefCell<Symbol>>, max_infer: &TextSize, for_annotation: bool, required_dependencies: &mut Vec<Vec<Rc<RefCell<Symbol>>>>) -> (Vec<Evaluation>, Vec<Diagnostic>) {
+        let file_weak = parent.borrow().get_file();
+        if let Some(file_weak) = file_weak {
+            if let Some(file_sym) = file_weak.upgrade() {
+                let sym_ref = file_sym.borrow();
+                if let Symbol::File(f) = &*sym_ref {
+                    if let Some(cached) = f.ast_eval_cache.get(&ast.range()) {
+                        return (cached.clone(), vec![]);
+                    }
+                }
+            }
+        }
+
         let from_module;
         if let Some(module) = parent.borrow().find_module() {
             from_module = ContextValue::MODULE(Rc::downgrade(&module));
@@ -587,7 +599,18 @@ impl Evaluation {
             (S!("module"), from_module),
             (S!("range"), ContextValue::RANGE(ast.range()))
         ]));
-        let analyze_result = Evaluation::analyze_ast(session, &ExprOrIdent::Expr(ast), parent, max_infer, &mut context, for_annotation, required_dependencies);
+        let analyze_result = Evaluation::analyze_ast(session, &ExprOrIdent::Expr(ast), parent.clone(), max_infer, &mut context, for_annotation, required_dependencies);
+        
+        let file_weak = parent.borrow().get_file();
+        if let Some(file_weak) = file_weak {
+            if let Some(file_sym) = file_weak.upgrade() {
+                let mut sym_ref = file_sym.borrow_mut();
+                if let Symbol::File(f) = &mut *sym_ref {
+                    f.ast_eval_cache.insert(ast.range(), analyze_result.evaluations.clone());
+                }
+            }
+        }
+        
         return (analyze_result.evaluations, analyze_result.diagnostics)
     }
 
@@ -907,7 +930,7 @@ impl Evaluation {
                                     }
                                 }
                                 //1: find __init__ method
-                                let init = base_sym.borrow().get_member_symbol(session, &S!("__init__"), module.clone(), true, false, false, false, false);
+                                let init = Symbol::get_member_symbol(&base_sym, session, &S!("__init__"), module.clone(), true, false, false, false, false);
                                 let mut found_hook = false;
                                 if let Some(init) = init.0.first() {
                                     let init_sym_file = init.borrow().get_file().as_ref().unwrap().upgrade().unwrap().clone();
@@ -1065,36 +1088,27 @@ impl Evaluation {
                                 }
                             }
                             let is_super = ibase.is_weak() && ibase.as_weak().is_super;
-                            let (attributes, mut attributes_diagnostics) = base_loc.borrow().get_member_symbol(session, &expr.attr.to_string(), module.clone(), false, false, false, true, is_super);
-                            for diagnostic in attributes_diagnostics.iter_mut(){
-                                diagnostic.range = FileMgr::textRange_to_temporary_Range(&expr.range())
-                            }
+                            let (attributes, mut attributes_diagnostics) = Symbol::get_member_symbol(&base_loc, session, &expr.attr.to_string(), module.clone(), false, false, false, true, is_super);
                             diagnostics.extend(attributes_diagnostics);
-                            if !attributes.is_empty() {
-                                let is_instance = ibase.as_weak().instance.unwrap_or(false);
-                                attributes.iter().for_each(|attribute|{
-                                    let instance = match attribute.borrow().typ() {
-                                        SymType::CLASS => match for_annotation{
-                                            true => Some(true),
-                                            false => Some(false)
-                                        },
-                                        SymType::VARIABLE => match for_annotation {
-                                            // this is a variable, but a follow_ref would probably lead to a class,
-                                            // and here, because of annotation, we know we want an instance
-                                            true => Some(true),
-                                            false => None
-                                        }
-                                        _ => None
-                                    };
-                                    let mut eval = Evaluation::eval_from_symbol(&Rc::downgrade(attribute), instance);
-                                    match eval.symbol.sym {
-                                        EvaluationSymbolPtr::WEAK(ref mut weak) => {
-                                            weak.context.insert(S!("base_attr"), ContextValue::SYMBOL(Rc::downgrade(&base_loc)));
-                                            weak.context.insert(S!("is_attr_of_instance"), ContextValue::BOOLEAN(is_instance));
-                                        },
-                                        _ => {}
-                                    }
-                                    evals.push(eval);
+                            for attribute in attributes.iter() {
+                                evals.push(Evaluation {
+                                    symbol: EvaluationSymbol {
+                                        sym: EvaluationSymbolPtr::WEAK(EvaluationSymbolWeak{
+                                            weak: Rc::downgrade(attribute),
+                                            context: HashMap::from([
+                                                (S!("base_attr"), ContextValue::SYMBOL(Rc::downgrade(&base_loc))),
+                                                (S!("is_attr_of_instance"), ContextValue::BOOLEAN(match ibase {
+                                                    EvaluationSymbolPtr::WEAK(w) => w.is_instance().unwrap_or(false),
+                                                    _ => false
+                                                }))
+                                            ]),
+                                            instance: None, //TODO check if instance ?
+                                            is_super: false,
+                                        }),
+                                        get_symbol_hook: None,
+                                    },
+                                    value: None,
+                                    range: Some(expr.range)
                                 });
                             }
                         }
@@ -1291,7 +1305,7 @@ impl Evaluation {
                     for base_eval_ptr in base_eval_ptrs.iter() {
                         let EvaluationSymbolPtr::WEAK(base_sym_weak_eval) = base_eval_ptr else {continue};
                         let Some(base_sym) = base_sym_weak_eval.weak.upgrade() else {continue};
-                        let (operator_functions, diags) = base_sym.borrow().get_member_symbol(session, &S!(method), module.clone(), true, false, true, false, false);
+                        let (operator_functions, diags) = Symbol::get_member_symbol(&base_sym, session, &S!(method), module.clone(), true, false, true, false, false);
                         diagnostics.extend(diags);
                         for operator_function in operator_functions.into_iter(){
                             for eval in operator_function.borrow().evaluations().unwrap_or(&vec![]).iter() {
@@ -1636,7 +1650,7 @@ impl Evaluation {
                             break;
                         }
                         if let Some(object) = &obj {
-                            let (symbols, _diagnostics) = object.borrow().get_member_symbol(session,
+                            let (symbols, _diagnostics) = Symbol::get_member_symbol(&object, session,
                                 &name.to_string(),
                                 from_module.clone(),
                                 false,
