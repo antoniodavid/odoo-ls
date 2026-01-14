@@ -307,6 +307,24 @@ impl DefinitionFeature {
             }
             index += 1;
         }
+        
+        links.sort_by(|a, b| {
+            let uri_cmp = a.target_uri.as_str().cmp(b.target_uri.as_str());
+            if uri_cmp == std::cmp::Ordering::Equal {
+                let range_a = (a.target_range.start.line, a.target_range.start.character, a.target_range.end.line, a.target_range.end.character);
+                let range_b = (b.target_range.start.line, b.target_range.start.character, b.target_range.end.line, b.target_range.end.character);
+                range_a.cmp(&range_b)
+            } else {
+                uri_cmp
+            }
+        });
+        links.dedup_by(|a, b| {
+            a.target_uri == b.target_uri && 
+            a.target_range.start.line == b.target_range.start.line &&
+            a.target_range.start.character == b.target_range.start.character &&
+            a.target_range.end.line == b.target_range.end.line &&
+            a.target_range.end.character == b.target_range.end.character
+        });
         Some(GotoDefinitionResponse::Link(links))
     }
 
@@ -384,6 +402,23 @@ impl DefinitionFeature {
                     }
                 }
             }
+            links.sort_by(|a, b| {
+                let uri_cmp = a.target_uri.as_str().cmp(b.target_uri.as_str());
+                if uri_cmp == std::cmp::Ordering::Equal {
+                    let range_a = (a.target_range.start.line, a.target_range.start.character, a.target_range.end.line, a.target_range.end.character);
+                    let range_b = (b.target_range.start.line, b.target_range.start.character, b.target_range.end.line, b.target_range.end.character);
+                    range_a.cmp(&range_b)
+                } else {
+                    uri_cmp
+                }
+            });
+            links.dedup_by(|a, b| {
+                a.target_uri == b.target_uri && 
+                a.target_range.start.line == b.target_range.start.line &&
+                a.target_range.start.character == b.target_range.start.character &&
+                a.target_range.end.line == b.target_range.end.line &&
+                a.target_range.end.character == b.target_range.end.character
+            });
             return Some(GotoDefinitionResponse::Link(links));
         }
         None

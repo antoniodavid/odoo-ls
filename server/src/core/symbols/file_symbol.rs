@@ -25,6 +25,7 @@ pub struct FileSymbol {
     pub dependents: Vec<Vec<Option<PtrWeakHashSet<Weak<RefCell<Symbol>>>>>>,
     pub processed_text_hash: u64,
     pub noqas: NoqaInfo,
+    pub loaded: bool,
 
     //Trait SymbolMgr
     pub sections: Vec<SectionRange>,
@@ -60,6 +61,7 @@ impl FileSymbol {
             processed_text_hash: 0,
             not_found_models: HashMap::new(),
             noqas: NoqaInfo::None,
+            loaded: false,
         };
         res._init_symbol_mgr();
         res

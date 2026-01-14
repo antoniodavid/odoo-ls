@@ -15,7 +15,6 @@ use crate::threads::SessionInfo;
 use crate::utils::{is_dir_cs, is_file_cs, PathSanitizer};
 
 use super::entry_point::{EntryPoint, EntryPointType};
-use super::odoo::SyncOdoo;
 use super::symbols::symbol::Symbol;
 
 pub struct ImportResult {
@@ -233,7 +232,6 @@ pub fn find_module(session: &mut SessionInfo, odoo_addons: Rc<RefCell<Symbol>>, 
             continue;
         };
         session.sync_odoo.modules.insert(name.clone(), Rc::downgrade(&module_symbol));
-        SyncOdoo::build_now(session, &module_symbol, BuildSteps::ARCH);
         return Some(module_symbol.clone());
     }
     None
@@ -282,6 +280,7 @@ fn _get_or_create_symbol(session: &mut SessionInfo, for_entry: &Rc<RefCell<Entry
         }
         match sym {
             Some(ref s) => {
+                Symbol::ensure_loaded(s, session);
                 let mut next_symbol = s.borrow().get_symbol(&(vec![branch.clone()], vec![]), u32::MAX);
                 if next_symbol.is_empty() && matches!(s.borrow().typ(), SymType::ROOT | SymType::NAMESPACE | SymType::PACKAGE(_) | SymType::COMPILED | SymType::DISK_DIR) {
                     next_symbol = match _resolve_new_symbol(session, s.clone(), &branch, asname.clone()) {
@@ -404,21 +403,18 @@ fn _resolve_new_symbol(session: &mut SessionInfo, parent: Rc<RefCell<Symbol>>, n
             let _rc_symbol = Symbol::create_from_path(session, &full_path, parent.clone(), false);
             if _rc_symbol.is_some() {
                 let _arc_symbol = _rc_symbol.unwrap();
-                SyncOdoo::build_now(session, &_arc_symbol, BuildSteps::ARCH);
                 return Ok(_arc_symbol);
             }
         } else if is_file_cs(full_path.with_extension("py").sanitize()) {
             let _arc_symbol = Symbol::create_from_path(session, &full_path.with_extension("py"), parent.clone(), false);
             if _arc_symbol.is_some() {
                 let _arc_symbol = _arc_symbol.unwrap();
-                SyncOdoo::build_now(session, &_arc_symbol, BuildSteps::ARCH);
                 return Ok(_arc_symbol);
             }
         } else if is_file_cs(full_path.with_extension("pyi").sanitize()) {
             let _arc_symbol = Symbol::create_from_path(session, &full_path.with_extension("pyi"), parent.clone(), false);
             if _arc_symbol.is_some() {
                 let _arc_symbol = _arc_symbol.unwrap();
-                SyncOdoo::build_now(session, &_arc_symbol, BuildSteps::ARCH);
                 return Ok(_arc_symbol);
             }
         } else if is_dir_cs(full_path.sanitize()) {
@@ -426,7 +422,6 @@ fn _resolve_new_symbol(session: &mut SessionInfo, parent: Rc<RefCell<Symbol>>, n
             let _rc_symbol = Symbol::create_from_path(session, &full_path, parent.clone(), false);
             if _rc_symbol.is_some() {
                 let _arc_symbol = _rc_symbol.unwrap();
-                SyncOdoo::build_now(session, &_arc_symbol, BuildSteps::ARCH);
                 return Ok(_arc_symbol);
             }
         } else if !matches!(parent.borrow().typ(), SymType::ROOT) {
@@ -539,7 +534,8 @@ pub fn get_all_valid_names(session: &mut SessionInfo, source_file_symbol: &Rc<Re
     result
 }
 
-fn valid_names_for_a_symbol(_session: &mut SessionInfo, symbol: &Rc<RefCell<Symbol>>, start_filter: &OYarn, only_on_disk: bool) -> HashMap<OYarn, SymType> {
+fn valid_names_for_a_symbol(session: &mut SessionInfo, symbol: &Rc<RefCell<Symbol>>, start_filter: &OYarn, only_on_disk: bool) -> HashMap<OYarn, SymType> {
+    Symbol::ensure_loaded(symbol, session);
     let mut res = HashMap::new();
     match symbol.borrow().typ() {
         SymType::FILE => {

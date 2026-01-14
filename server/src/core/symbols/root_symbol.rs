@@ -27,7 +27,6 @@ impl RootSymbol {
     }
 
     pub fn add_file(&mut self, file: &Rc<RefCell<Symbol>>) {
-        file.borrow_mut().set_is_external(true);
         self.module_symbols.insert(file.borrow().name().clone(), file.clone());
     }
 

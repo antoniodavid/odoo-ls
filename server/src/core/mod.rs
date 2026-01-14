@@ -7,6 +7,7 @@ pub mod file_mgr;
 pub mod import_resolver;
 pub mod model;
 pub mod odoo;
+pub mod persist;
 pub mod python_arch_builder;
 pub mod python_arch_builder_hooks;
 pub mod python_arch_eval;

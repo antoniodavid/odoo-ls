@@ -117,6 +117,7 @@ pub struct PythonPackageSymbol {
     pub dependents: Vec<Vec<Option<PtrWeakHashSet<Weak<RefCell<Symbol>>>>>>,
     pub processed_text_hash: u64,
     pub noqas: NoqaInfo,
+    pub loaded: bool,
 
     //Trait SymbolMgr
     pub sections: Vec<SectionRange>,
@@ -153,6 +154,7 @@ impl PythonPackageSymbol {
             dependents: vec![],
             processed_text_hash: 0,
             noqas: NoqaInfo::None,
+            loaded: false,
         };
         res._init_symbol_mgr();
         res

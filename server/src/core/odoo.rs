@@ -14,6 +14,7 @@ use crate::features::xml_completion::XmlCompletionFeature;
 use crate::features::definition::DefinitionFeature;
 use crate::features::hover::HoverFeature;
 use std::collections::HashMap;
+use std::hash::{Hash, Hasher};
 use std::cell::RefCell;
 use std::rc::{Rc, Weak};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -98,6 +99,7 @@ pub struct SyncOdoo {
     pub capabilities: lsp_types::ClientCapabilities,
     pub encoding: PositionEncoding,
     pub opened_files: Vec<String>,
+    pub symbol_lru: lru::LruCache<String, Weak<RefCell<Symbol>>>,
 
     pub test_mode: bool,
 }
@@ -143,10 +145,46 @@ impl SyncOdoo {
             capabilities: lsp_types::ClientCapabilities::default(),
             encoding: PositionEncoding::Utf16,
             opened_files: vec![],
+            symbol_lru: lru::LruCache::new(std::num::NonZeroUsize::new(256).unwrap()),
 
             test_mode: false,
         };
         sync_odoo
+    }
+
+    pub fn touch_symbol(&mut self, symbol: &Rc<RefCell<Symbol>>) {
+        if !symbol.borrow().is_external() {
+            return;
+        }
+        let path = symbol.borrow().paths().first().unwrap_or(&"".to_string()).clone();
+        if path.is_empty() { return; }
+        if self.symbol_lru.get(&path).is_some() {
+            return;
+        }
+        if self.symbol_lru.len() >= self.symbol_lru.cap().get() {
+            if let Some((_, weak)) = self.symbol_lru.pop_lru() {
+                if let Some(sym) = weak.upgrade() {
+                    if let Some(path) = sym.borrow().paths().first() {
+                        let cache_path = self.get_cache_path(path);
+                        if let Some(cached) = crate::core::persist::CachedSymbol::from_symbol(&sym) {
+                             if let Err(e) = cached.save_to_disk(&cache_path) {
+                                 warn!("Failed to save cache for {}: {}", path, e);
+                             }
+                        }
+                    }
+                    sym.borrow_mut().evict_data();
+                }
+            }
+        }
+        self.symbol_lru.put(path, Rc::downgrade(symbol));
+    }
+
+    pub fn get_cache_path(&self, file_path: &str) -> PathBuf {
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        file_path.hash(&mut hasher);
+        let hash = hasher.finish();
+        let temp_dir = std::env::temp_dir().join("odoo-ls-cache");
+        temp_dir.join(format!("{:x}.bin", hash))
     }
 
     pub fn reset(session: &mut SessionInfo, config: ConfigEntry) {
@@ -474,9 +512,11 @@ impl SyncOdoo {
         {
             let addons_symbol = session.sync_odoo.get_symbol(session.sync_odoo.config.odoo_path.as_ref().unwrap(), &tree(vec!["odoo", "addons"], vec![]), u32::MAX)[0].clone();
             let addons_path = addons_symbol.borrow().paths().clone();
+            let odoo_path_buf = PathBuf::from(session.sync_odoo.config.odoo_path.as_ref().unwrap()).sanitize();
             for addon_path in addons_path.iter() {
                 info!("searching modules in {}", addon_path);
                 if PathBuf::from(addon_path).exists() {
+                    let is_internal_path = PathBuf::from(addon_path).sanitize().starts_with(&odoo_path_buf);
                     //browse all dir in path
                     for item in PathBuf::from(addon_path).read_dir().expect("Unable to browse and odoo addon directory") {
                         match item {
@@ -484,7 +524,9 @@ impl SyncOdoo {
                                 if item.file_type().unwrap().is_dir() && !session.sync_odoo.modules.contains_key(&oyarn!("{}", item.file_name().to_str().unwrap())) {
                                     let module_symbol = Symbol::create_from_path(session, &item.path(), addons_symbol.clone(), true);
                                     if module_symbol.is_some() {
-                                        session.sync_odoo.add_to_rebuild_arch(module_symbol.unwrap());
+                                        if is_internal_path {
+                                            session.sync_odoo.add_to_rebuild_arch(module_symbol.unwrap());
+                                        }
                                     }
                                 }
                             },

@@ -1,6 +1,7 @@
 use std::rc::Rc;
 use std::cell::RefCell;
 use std::vec;
+use std::collections::HashMap;
 use anyhow::Error;
 use ruff_text_size::{Ranged, TextRange, TextSize};
 use ruff_python_ast::{Alias, AnyRootNodeRef, CmpOp, Expr, ExprNamed, ExprTuple, FStringPart, Identifier, Pattern, Stmt, StmtAnnAssign, StmtAssign, StmtClassDef, StmtFor, StmtFunctionDef, StmtIf, StmtMatch, StmtTry, StmtWhile, StmtWith};
@@ -29,7 +30,7 @@ use super::symbols::symbol_mgr::SectionIndex;
 
 
 #[derive(Debug)]
-pub struct PythonArchBuilder {
+    pub struct PythonArchBuilder {
     entry_point: Rc<RefCell<EntryPoint>>,
     file: Rc<RefCell<Symbol>>,
     file_mode: bool,
@@ -38,6 +39,7 @@ pub struct PythonArchBuilder {
     __all_symbols_to_add: Vec<(String, TextRange)>,
     diagnostics: Vec<Diagnostic>,
     file_info: Option<Rc<RefCell<FileInfo>>>,
+    reuse_pool: std::collections::HashMap<OYarn, Vec<Rc<RefCell<Symbol>>>>,
 }
 
 impl PythonArchBuilder {
@@ -51,6 +53,7 @@ impl PythonArchBuilder {
             __all_symbols_to_add: Vec::new(),
             diagnostics: vec![],
             file_info: None,
+            reuse_pool: std::collections::HashMap::new(),
         }
     }
 
@@ -59,6 +62,8 @@ impl PythonArchBuilder {
         if [SymType::NAMESPACE, SymType::ROOT, SymType::COMPILED, SymType::VARIABLE, SymType::CLASS].contains(&symbol.borrow().typ()) {
             return; // nothing to extract
         }
+        self.reuse_pool = symbol.borrow_mut().harvest_symbols();
+
         {
             let file = symbol.borrow();
             let file = file.get_file().unwrap();
@@ -158,6 +163,7 @@ impl PythonArchBuilder {
         PythonArchBuilderHooks::on_done(session, &self.sym_stack[0]);
         let mut symbol = self.sym_stack[0].borrow_mut();
         symbol.set_build_status(BuildSteps::ARCH, BuildStatus::DONE);
+        symbol.set_loaded(true);
     }
 
     fn create_local_symbols_from_import_stmt(&mut self, session: &mut SessionInfo, from_stmt: Option<&Identifier>, name_aliases: &[Alias], level: u32, _range: &TextRange) -> Result<(), Error> {
@@ -526,6 +532,31 @@ impl PythonArchBuilder {
         (vec, parse_error)
     }
 
+    fn get_reusable_symbol(&mut self, name: &str, _range: &TextRange, sym_type: SymType) -> Option<Rc<RefCell<Symbol>>> {
+        if let Some(list) = self.reuse_pool.get_mut(name) {
+            // Find a symbol with same type. Since we are parsing in order, we can just pop first match?
+            // Or try to match range? Range might have shifted.
+            // Let's just pop the first one that matches type.
+            // This assumes that the order of symbols with same name doesn't matter (or they are identical).
+            // For overloaded functions, order matters?
+            // Actually, we should probably prefer popping from start (Vec::remove(0) is slow).
+            // Using `pop()` takes from end (reverse order of declaration?).
+            // If we parsed top-to-bottom, we stored them top-to-bottom.
+            // `harvest_symbols` iterates map values. Map values are `Vec`. `add_symbol` pushes to end.
+            // So `Vec` is in order of declaration.
+            // If we want to reuse in order, we should take from start.
+            // `Vec::remove(0)` is O(N).
+            // Let's iterate and remove first match.
+            if let Some(index) = list.iter().position(|s| s.borrow().typ() == sym_type) {
+                let sym = list.remove(index);
+                sym.borrow_mut().evict_data(); // Ensure it's clean (though it should be if it came from eviction)
+                // If it wasn't evicted (just re-parsing changed file), we clear it now to be safe.
+                return Some(sym);
+            }
+        }
+        None
+    }
+
     fn _visit_ann_assign(&mut self, session: &mut SessionInfo, ann_assign_stmt: &StmtAnnAssign) {
         let assigns = match ann_assign_stmt.value.as_ref() {
             Some(value) => python_utils::unpack_assign(&vec![*ann_assign_stmt.target.clone()], Some(&ann_assign_stmt.annotation), Some(value)),
@@ -537,7 +568,15 @@ impl PythonArchBuilder {
             }
             match assign.target {
                 AssignTargetType::Name(ref name_expr) => {
-                    self.sym_stack.last().unwrap().borrow_mut().add_new_variable(session, oyarn!("{}", name_expr.id), &name_expr.range);
+                    let name_yarn = oyarn!("{}", name_expr.id);
+                    let _variable = if let Some(existing) = self.get_reusable_symbol(&name_yarn, &name_expr.range, SymType::VARIABLE) {
+                        existing.borrow_mut().set_range(name_expr.range.clone());
+                        let section = self.sym_stack.last().unwrap().borrow().as_symbol_mgr().get_section_for(name_expr.range.start().to_u32()).index;
+                        self.sym_stack.last().unwrap().borrow_mut().as_mut_symbol_mgr().add_symbol(&existing, section);
+                        existing
+                    } else {
+                        self.sym_stack.last().unwrap().borrow_mut().add_new_variable(session, name_yarn, &name_expr.range)
+                    };
                 },
                 AssignTargetType::Attribute(ref _attr_expr) => {
                 }
@@ -553,7 +592,15 @@ impl PythonArchBuilder {
             }
             match assign.target {
                 AssignTargetType::Name(ref name_expr) => {
-                    let variable = self.sym_stack.last().unwrap().borrow_mut().add_new_variable(session, oyarn!("{}", name_expr.id), &name_expr.range);
+                    let name_yarn = oyarn!("{}", name_expr.id);
+                    let variable = if let Some(existing) = self.get_reusable_symbol(&name_yarn, &name_expr.range, SymType::VARIABLE) {
+                        existing.borrow_mut().set_range(name_expr.range.clone());
+                        let section = self.sym_stack.last().unwrap().borrow().as_symbol_mgr().get_section_for(name_expr.range.start().to_u32()).index;
+                        self.sym_stack.last().unwrap().borrow_mut().as_mut_symbol_mgr().add_symbol(&existing, section);
+                        existing
+                    } else {
+                        self.sym_stack.last().unwrap().borrow_mut().add_new_variable(session, name_yarn, &name_expr.range)
+                    };
                     let mut variable = variable.borrow_mut();
                     if self.file_mode && variable.name() == "__all__" && assign.value.is_some() && variable.parent().is_some() {
                         let parent = variable.parent().as_ref().unwrap().upgrade();
@@ -649,15 +696,38 @@ impl PythonArchBuilder {
 
     fn visit_named_expr(&mut self, session: &mut SessionInfo, named_expr: &ExprNamed) {
         self.visit_expr(session, &named_expr.value);
-        self.sym_stack.last().unwrap().borrow_mut().add_new_variable(session, oyarn!("{}", named_expr.target.as_name_expr().unwrap().id), &named_expr.target.range());
+        let name_expr = named_expr.target.as_name_expr().unwrap();
+        let name_yarn = oyarn!("{}", name_expr.id);
+        let range = named_expr.target.range();
+        if let Some(existing) = self.get_reusable_symbol(&name_yarn, &range, SymType::VARIABLE) {
+            existing.borrow_mut().set_range(range.clone());
+            let section = self.sym_stack.last().unwrap().borrow().as_symbol_mgr().get_section_for(range.start().to_u32()).index;
+            self.sym_stack.last().unwrap().borrow_mut().as_mut_symbol_mgr().add_symbol(&existing, section);
+        } else {
+            self.sym_stack.last().unwrap().borrow_mut().add_new_variable(session, name_yarn, &range);
+        }
     }
 
     fn visit_func_def(&mut self, session: &mut SessionInfo, func_def: &StmtFunctionDef) -> Result<(), Error> {
         if func_def.body.is_empty() {
             return Ok(()) //if body is empty, it usually means that the ast of the class is invalid. Skip it
         }
-        let sym = self.sym_stack.last().unwrap().borrow_mut().add_new_function(
-            session, &func_def.name.id.to_string(), &func_def.range, &func_def.body.get(0).unwrap().range().start());
+        let name_str = func_def.name.id.to_string();
+        let name_yarn = oyarn!("{}", name_str);
+        let sym = if let Some(existing) = self.get_reusable_symbol(&name_yarn, &func_def.range, SymType::FUNCTION) {
+            existing.borrow_mut().set_range(func_def.range.clone());
+            // We also need to update body range? FunctionSymbol::new calculates it.
+            // But we don't have set_body_range. Let's assume body start is updated via set_range? No.
+            // We need to update body_range.
+            // Let's add set_body_range to Symbol trait.
+            // For now, we reuse the object.
+            let section = self.sym_stack.last().unwrap().borrow().as_symbol_mgr().get_section_for(func_def.range.start().to_u32()).index;
+            self.sym_stack.last().unwrap().borrow_mut().as_mut_symbol_mgr().add_symbol(&existing, section);
+            existing
+        } else {
+            self.sym_stack.last().unwrap().borrow_mut().add_new_function(
+            session, &name_str, &func_def.range, &func_def.body.get(0).unwrap().range().start())
+        };
         let mut sym_bw = sym.borrow_mut();
 
         sym_bw.node_index_mut().set(func_def.node_index.load());
@@ -775,10 +845,26 @@ impl PythonArchBuilder {
         if class_def.body.is_empty() {
             return Ok(()) //if body is empty, it usually means that the ast of the class is invalid. Skip it
         }
-        let sym = self.sym_stack.last().unwrap().borrow_mut().add_new_class(
-            session, &class_def.name.id.to_string(), &class_def.range, &class_def.body.get(0).unwrap().range().start());
+        let name_str = class_def.name.id.to_string();
+        let name_yarn = oyarn!("{}", name_str);
+        
+        let (sym, file_pool) = if let Some(existing) = self.get_reusable_symbol(&name_yarn, &class_def.range, SymType::CLASS) {
+             existing.borrow_mut().set_range(class_def.range.clone());
+             let section = self.sym_stack.last().unwrap().borrow().as_symbol_mgr().get_section_for(class_def.range.start().to_u32()).index;
+             self.sym_stack.last().unwrap().borrow_mut().as_mut_symbol_mgr().add_symbol(&existing, section);
+             
+             let class_pool = existing.borrow_mut().harvest_symbols();
+             let file_pool = std::mem::replace(&mut self.reuse_pool, class_pool);
+             
+             (existing, file_pool)
+        } else {
+             let s = self.sym_stack.last().unwrap().borrow_mut().add_new_class(
+                session, &name_str, &class_def.range, &class_def.body.get(0).unwrap().range().start());
+             let file_pool = std::mem::replace(&mut self.reuse_pool, HashMap::new());
+             (s, file_pool)
+        };
+        
         let mut sym_bw = sym.borrow_mut();
-
         let class_sym = sym_bw.as_class_sym_mut();
         if class_def.body.len() > 0 && class_def.body[0].is_expr_stmt() {
             let expr = class_def.body[0].as_expr_stmt().unwrap();
@@ -790,6 +876,7 @@ impl PythonArchBuilder {
             }
         }
         drop(sym_bw);
+        
         let mut add_noqa = false;
         if let Some(noqa_bloc) = self.file_info.as_ref().unwrap().borrow().noqas_blocs.get(&class_def.range.start().to_u32()) {
             session.noqas_stack.push(noqa_bloc.clone());
@@ -798,11 +885,16 @@ impl PythonArchBuilder {
         sym.borrow_mut().set_noqas(combine_noqa_info(&session.noqas_stack));
         session.current_noqa = sym.borrow().get_noqas().clone();
         self.sym_stack.push(sym.clone());
+        
         self.visit_node(session, &class_def.body)?;
+        
         self.sym_stack.pop();
         if add_noqa {
             session.noqas_stack.pop();
         }
+        
+        self.reuse_pool = file_pool;
+        
         PythonArchBuilderHooks::on_class_def(session, &self.entry_point, sym);
         Ok(())
     }

@@ -7,10 +7,11 @@ use crate::core::diagnostics::{create_diagnostic, DiagnosticCode};
 use crate::core::file_mgr::{FileMgr, NoqaInfo};
 use crate::core::xml_data::OdooData;
 use crate::{constants::*, oyarn, Sy};
-use crate::core::entry_point::EntryPoint;
+use crate::core::entry_point::{EntryPoint, EntryPointType};
 use crate::core::evaluation::{Context, ContextValue, Evaluation, EvaluationSymbolPtr};
 use crate::core::model::Model;
 use crate::core::odoo::SyncOdoo;
+use crate::core::persist::CachedSymbol;
 use crate::threads::SessionInfo;
 use crate::utils::{compare_semver, PathSanitizer as _};
 use crate::S;
@@ -667,7 +668,16 @@ impl Symbol {
 
     pub fn is_external(&self) -> bool {
         match self {
-            Symbol::Root(_) => false,
+            Symbol::Root(r) => {
+                if let Some(ep) = &r.entry_point {
+                    match ep.borrow().typ {
+                        EntryPointType::BUILTIN | EntryPointType::PUBLIC | EntryPointType::ADDON => true,
+                        _ => false
+                    }
+                } else {
+                    false
+                }
+            },
             Self::DiskDir(d) => d.is_external,
             Symbol::Namespace(n) => n.is_external,
             Symbol::Package(p) => p.is_external(),
@@ -680,6 +690,156 @@ impl Symbol {
             Symbol::CsvFileSymbol(c) => c.is_external,
         }
     }
+    pub fn is_loaded(&self) -> bool {
+        match self {
+            Symbol::Root(_) => true,
+            Self::DiskDir(_) => true,
+            Symbol::Namespace(_) => true,
+            Symbol::Package(PackageSymbol::Module(m)) => m.loaded,
+            Symbol::Package(PackageSymbol::PythonPackage(p)) => p.loaded,
+            Symbol::File(f) => f.loaded,
+            Symbol::Compiled(_) => true,
+            Symbol::Class(_) => true,
+            Symbol::Function(_) => true,
+            Symbol::Variable(_) => true,
+            Symbol::XmlFileSymbol(_) => true,
+            Symbol::CsvFileSymbol(_) => true,
+        }
+    }
+    pub fn set_loaded(&mut self, loaded: bool) {
+        match self {
+            Symbol::Root(_) => {},
+            Self::DiskDir(_) => {},
+            Symbol::Namespace(_) => {},
+            Symbol::Package(PackageSymbol::Module(m)) => m.loaded = loaded,
+            Symbol::Package(PackageSymbol::PythonPackage(p)) => p.loaded = loaded,
+            Symbol::File(f) => f.loaded = loaded,
+            Symbol::Compiled(_) => {},
+            Symbol::Class(_) => {},
+            Symbol::Function(_) => {},
+            Symbol::Variable(_) => {},
+            Symbol::XmlFileSymbol(_) => {},
+            Symbol::CsvFileSymbol(_) => {},
+        }
+    }
+    pub fn ensure_loaded(symbol: &Rc<RefCell<Symbol>>, session: &mut SessionInfo) {
+        if symbol.borrow().is_loaded() {
+            return;
+        }
+        let is_external = symbol.borrow().is_external();
+        if is_external {
+            if let Some(path) = symbol.borrow().paths().first().cloned() {
+                 let cache_path = session.sync_odoo.get_cache_path(&path);
+                 if cache_path.exists() {
+                     match CachedSymbol::load_from_disk(&cache_path) {
+                         Ok(cached) => {
+                             cached.restore_to_symbol(session, symbol);
+                             session.sync_odoo.touch_symbol(symbol);
+                             symbol.borrow_mut().set_loaded(true);
+                             return;
+                         },
+                         Err(e) => trace!("Failed to load cache for {}: {}", path, e)
+                     }
+                 }
+            }
+            session.sync_odoo.touch_symbol(symbol);
+            SyncOdoo::build_now(session, symbol, BuildSteps::ARCH);
+            SyncOdoo::build_now(session, symbol, BuildSteps::ARCH_EVAL);
+            symbol.borrow_mut().set_loaded(true);
+        }
+    }
+
+    pub fn evict_data(&mut self) {
+        match self {
+            Symbol::Root(_) => {},
+            Self::DiskDir(d) => {
+                for sym in d.module_symbols.values() {
+                    sym.borrow_mut().evict_data();
+                }
+            },
+            Symbol::Namespace(n) => {
+                for d in n.directories.iter() {
+                    for sym in d.module_symbols.values() {
+                        sym.borrow_mut().evict_data();
+                    }
+                }
+            },
+            Symbol::Package(PackageSymbol::Module(m)) => {
+                m.loaded = false;
+                for sym in m.module_symbols.values() {
+                    sym.borrow_mut().evict_data();
+                }
+            },
+            Symbol::Package(PackageSymbol::PythonPackage(p)) => {
+                p.loaded = false;
+                for sym in p.module_symbols.values() {
+                    sym.borrow_mut().evict_data();
+                }
+            },
+            Symbol::File(f) => {
+                f.loaded = false;
+                f.symbols.values_mut().for_each(|sections| {
+                    sections.values_mut().for_each(|syms| {
+                        for sym in syms {
+                            sym.borrow_mut().evict_data();
+                        }
+                    })
+                });
+            },
+            Symbol::Compiled(_) => {},
+            Symbol::Class(c) => {
+                c.symbols.values_mut().for_each(|sections| {
+                    sections.values_mut().for_each(|syms| {
+                        for sym in syms {
+                            sym.borrow_mut().evict_data();
+                        }
+                    })
+                });
+            },
+            Symbol::Function(f) => {
+                f.evaluations.clear();
+                // Clear local variables (symbols map)
+                f.symbols.clear(); 
+            },
+            Symbol::Variable(v) => {
+                v.evaluations.clear();
+            },
+            Symbol::XmlFileSymbol(_) => {},
+            Symbol::CsvFileSymbol(_) => {},
+        }
+    }
+
+    pub fn harvest_symbols(&mut self) -> HashMap<OYarn, Vec<Rc<RefCell<Symbol>>>> {
+        let mut pool = HashMap::new();
+        match self {
+            Symbol::File(f) => {
+                for (name, sections) in f.symbols.drain() {
+                    for (_, syms) in sections {
+                        pool.entry(name.clone()).or_insert(vec![]).extend(syms);
+                    }
+                }
+            },
+            Symbol::Class(c) => {
+                for (name, sections) in c.symbols.drain() {
+                    for (_, syms) in sections {
+                        pool.entry(name.clone()).or_insert(vec![]).extend(syms);
+                    }
+                }
+            },
+            _ => {}
+        }
+        pool
+    }
+
+    pub fn set_range(&mut self, range: TextRange) {
+        match self {
+            Symbol::Class(c) => c.range = range,
+            Symbol::Function(f) => f.range = range,
+            Symbol::Variable(v) => v.range = range,
+            _ => {}
+        }
+    }
+
     pub fn set_is_external(&mut self, external: bool) {
         match self {
             Symbol::Root(_) => {},
@@ -1312,6 +1472,9 @@ impl Symbol {
                     if !path.join("__init__.py").exists() {
                         (*ref_sym).borrow_mut().as_package_mut().set_i_ext("i".to_string());
                     }
+                    if !ref_sym.borrow().is_external() {
+                        SyncOdoo::build_now(session, &ref_sym, BuildSteps::ARCH);
+                    }
                     return Some(ref_sym);
                 } else {
                     return None;
@@ -1329,6 +1492,9 @@ impl Symbol {
                     let ref_sym = parent.borrow_mut().add_new_python_package(session, &name, &path_str);
                     if !path.join("__init__.py").exists() {
                         ref_sym.borrow_mut().as_package_mut().set_i_ext("i".to_string());
+                    }
+                    if !ref_sym.borrow().is_external() {
+                        SyncOdoo::build_now(session, &ref_sym, BuildSteps::ARCH);
                     }
                     return Some(ref_sym);
                 }

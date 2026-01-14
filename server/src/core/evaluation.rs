@@ -246,11 +246,21 @@ pub enum EvaluationSymbolPtr {
     ANY
 }
 
-#[derive(Debug, Default, Clone, PartialEq)]
+#[derive(Debug, Default, Clone)]
 pub struct EvaluationSymbol {
     sym: EvaluationSymbolPtr,
     pub get_symbol_hook: Option<GetSymbolHook>,
 }
+
+impl PartialEq for EvaluationSymbol {
+    fn eq(&self, other: &Self) -> bool {
+        self.sym == other.sym
+        && self.get_symbol_hook.is_some() == other.get_symbol_hook.is_some()
+        && (self.get_symbol_hook.is_none() || std::ptr::eq(self.get_symbol_hook.unwrap() as *const (), other.get_symbol_hook.unwrap() as *const ()))
+    }
+}
+
+impl Eq for EvaluationSymbol {}
 
 #[derive(Default)]
 pub struct AnalyzeAstResult {
@@ -1353,7 +1363,6 @@ impl Evaluation {
                 ArgumentType::KWARG => {
                     kwarg_index = index as i32;
                 },
-                _ => {}
             }
         }
         if !function.is_static {
