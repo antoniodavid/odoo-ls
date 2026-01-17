@@ -685,8 +685,8 @@ pub fn restore_file_from_cache(
     );
     file_sym.processed_text_hash = cached_file.processed_text_hash;
     file_sym.arch_status = crate::constants::BuildStatus::DONE;
-    file_sym.arch_eval_status = crate::constants::BuildStatus::DONE;
-    file_sym.validation_status = crate::constants::BuildStatus::DONE;
+    file_sym.arch_eval_status = crate::constants::BuildStatus::PENDING;
+    file_sym.validation_status = crate::constants::BuildStatus::PENDING;
 
     let file_rc = Rc::new(RefCell::new(Symbol::File(file_sym)));
     file_rc.borrow_mut().set_weak_self(Rc::downgrade(&file_rc));
@@ -695,4 +695,37 @@ pub fn restore_file_from_cache(
     restore_symbols_to_parent(&cached_file.symbols, file_rc.clone(), is_external);
 
     file_rc
+}
+
+pub fn collect_files_recursively(
+    module_symbols: &std::collections::HashMap<crate::constants::OYarn, std::rc::Rc<std::cell::RefCell<crate::core::symbols::symbol::Symbol>>>,
+) -> Vec<CachedFile> {
+    use crate::core::symbols::symbol::Symbol;
+    use crate::core::symbols::package_symbol::PackageSymbol;
+    use crate::constants::SymType;
+    
+    let mut cached_files = Vec::new();
+    
+    for (_name, sym_rc) in module_symbols.iter() {
+        let sym = sym_rc.borrow();
+        match sym.typ() {
+            SymType::FILE => {
+                cached_files.push(CachedFile::from_file_symbol(sym.as_file()));
+            }
+            SymType::PACKAGE(_) => {
+                match &*sym {
+                    Symbol::Package(PackageSymbol::PythonPackage(p)) => {
+                        cached_files.extend(collect_files_recursively(&p.module_symbols));
+                    }
+                    Symbol::Package(PackageSymbol::Module(m)) => {
+                        cached_files.extend(collect_files_recursively(&m.module_symbols));
+                    }
+                    _ => {}
+                }
+            }
+            _ => {}
+        }
+    }
+    
+    cached_files
 }

@@ -613,8 +613,8 @@ impl ModuleSymbol {
             parent: None,
             module_symbols: HashMap::new(),
             arch_status: BuildStatus::DONE,
-            arch_eval_status: BuildStatus::DONE,
-            validation_status: BuildStatus::DONE,
+            arch_eval_status: BuildStatus::PENDING,
+            validation_status: BuildStatus::PENDING,
             sections: vec![],
             symbols: HashMap::new(),
             ext_symbols: HashMap::new(),
@@ -628,6 +628,18 @@ impl ModuleSymbol {
         };
         module._init_symbol_mgr();
         Some(module)
+    }
+
+    pub fn populate_models_from_cache_static(session: &mut SessionInfo, cached: &CachedModule, module_symbol_rc: Rc<RefCell<Symbol>>) {
+        if let Symbol::Package(super::package_symbol::PackageSymbol::Module(ref mut m)) = *module_symbol_rc.borrow_mut() {
+            m.populate_models_from_cache(session, cached, module_symbol_rc.clone());
+        }
+    }
+
+    pub fn populate_files_from_cache_static(session: &mut SessionInfo, cached: &CachedModule, module_symbol_rc: Rc<RefCell<Symbol>>) {
+        if let Symbol::Package(super::package_symbol::PackageSymbol::Module(ref mut m)) = *module_symbol_rc.borrow_mut() {
+            m.populate_files_from_cache(session, cached, module_symbol_rc.clone());
+        }
     }
 
     pub fn populate_models_from_cache(&mut self, session: &mut SessionInfo, cached: &CachedModule, module_symbol_rc: Rc<RefCell<Symbol>>) {
@@ -682,17 +694,27 @@ impl ModuleSymbol {
             let model_rc = session.sync_odoo.models.entry(model_name.clone()).or_insert_with(|| {
                 Rc::new(RefCell::new(crate::core::model::Model::new(model_name.clone(), class_rc.clone())))
             }).clone();
-            model_rc.borrow_mut().add_symbol_with_module(session, class_rc.clone(), Some(module_symbol_rc.clone()));
+            model_rc.borrow_mut().add_symbol_with_module(session, class_rc.clone(), None);
         }
     }
 
-    pub fn populate_files_from_cache(&mut self, cached: &CachedModule, module_symbol_rc: Rc<RefCell<Symbol>>) {
+    pub fn populate_files_from_cache(&mut self, session: &mut crate::threads::SessionInfo, cached: &CachedModule, module_symbol_rc: Rc<RefCell<Symbol>>) {
         use crate::core::cache::restore_file_from_cache;
+        use crate::constants::SymType;
         
         for cached_file in &cached.files {
             let file_rc = restore_file_from_cache(cached_file, module_symbol_rc.clone(), self.is_external);
             let name = file_rc.borrow().name().clone();
-            self.module_symbols.insert(name, file_rc);
+            let path = cached_file.path.clone();
+            
+            self.module_symbols.insert(name, file_rc.clone());
+            
+            session.sync_odoo.get_file_mgr().borrow_mut()
+                .create_file_info_for_cached(&path, cached_file.processed_text_hash);
+            
+            if file_rc.borrow().typ() == SymType::FILE {
+                self.data_symbols.insert(path, file_rc);
+            }
         }
     }
 
@@ -792,19 +814,8 @@ impl ModuleSymbol {
     }
 
     fn collect_cached_files(&self, _session: &SessionInfo) -> Vec<crate::core::cache::CachedFile> {
-        use crate::core::cache::CachedFile;
-        use crate::constants::SymType;
-        
-        let mut cached_files = Vec::new();
-        
-        for (_name, file_sym_rc) in self.module_symbols.iter() {
-            let file_sym = file_sym_rc.borrow();
-            if file_sym.typ() == SymType::FILE {
-                cached_files.push(CachedFile::from_file_symbol(file_sym.as_file()));
-            }
-        }
-        
-        cached_files
+        crate::core::cache::collect_files_recursively(&self.module_symbols)
     }
+
 
 }

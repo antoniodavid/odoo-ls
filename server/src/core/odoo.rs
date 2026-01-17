@@ -1,4 +1,3 @@
-use crate::constants::OYarn;
 use crate::core::cache::{get_file_metadata, CacheData, CacheManager};
 use crate::core::diagnostics::{create_diagnostic, DiagnosticCode};
 use crate::core::entry_point::EntryPointType;
@@ -750,19 +749,20 @@ impl SyncOdoo {
                                                             Rc::downgrade(&addons_symbol),
                                                         ));
 
-                                                        // Hydrate models
-                                                        if let Symbol::Package(
-                                                            PackageSymbol::Module(ref mut m),
-                                                        ) = *module_rc.borrow_mut()
+                                                        // Hydrate models and files from cache with ARCH_EVAL support
+                                                        ModuleSymbol::populate_models_from_cache_static(session, &cached_module, module_rc.clone());
+                                                        ModuleSymbol::populate_files_from_cache_static(session, &cached_module, module_rc.clone());
+
                                                         {
-                                                            m.populate_models_from_cache(
-                                                                session,
-                                                                &cached_module,
-                                                                module_rc.clone(),
-                                                            );
-                                                        }
-                                                        if let Symbol::Package(PackageSymbol::Module(ref mut m)) = *module_rc.borrow_mut() {
-                                                            m.populate_files_from_cache(&cached_module, module_rc.clone());
+                                                            let module_ref = module_rc.borrow();
+                                                            let entry = session.sync_odoo.get_main_entry();
+                                                            let module_sym = module_ref.as_module_package();
+                                                            let count = module_sym.data_symbols.len();
+                                                            for (path, file_rc) in module_sym.data_symbols.iter() {
+                                                                entry.borrow_mut().data_symbols.insert(path.clone(), Rc::downgrade(file_rc));
+                                                                session.sync_odoo.add_to_rebuild_arch_eval(file_rc.clone());
+                                                            }
+                                                            info!("Registered {} files from cache for module {}", count, module_name);
                                                         }
 
                                                         info!(
