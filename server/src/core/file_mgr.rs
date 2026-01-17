@@ -634,6 +634,19 @@ impl FileMgr {
         }
     }
 
+    pub fn create_file_info_for_cached(&mut self, path: &str, processed_text_hash: u64) -> Rc<RefCell<FileInfo>> {
+        if let Some(existing) = self.files.get(path) {
+            return existing.clone();
+        }
+        
+        let file_info = FileInfo::new(path.to_string());
+        file_info.file_info_ast.borrow_mut().text_hash = processed_text_hash;
+        
+        let file_info_rc = Rc::new(RefCell::new(file_info));
+        self.files.insert(path.to_string(), file_info_rc.clone());
+        file_info_rc
+    }
+
     pub fn delete_path(session: &mut SessionInfo, uri: &String) {
         //delete all files that are the uri or in subdirectory
         let matching_keys: Vec<String> = session.sync_odoo.get_file_mgr().borrow_mut().files.keys().filter(|k| PathBuf::from(k).starts_with(uri)).cloned().collect();

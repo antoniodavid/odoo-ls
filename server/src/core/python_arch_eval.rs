@@ -63,6 +63,7 @@ impl PythonArchEval {
         if symbol.borrow().build_status(BuildSteps::ARCH) != BuildStatus::DONE || symbol.borrow().build_status(BuildSteps::ARCH_EVAL) != BuildStatus::PENDING {
             return;
         }
+        trace!("[LOG A - CACHE] eval_arch entry for: {}", symbol.borrow().paths().first().unwrap_or(&S!("unknown")));
         {
             let file = symbol.borrow();
             let file = file.get_file().unwrap();
@@ -96,6 +97,10 @@ impl PythonArchEval {
             let (ast, maybe_func_stmt) = match self.file_mode {
                 true => {
                     if file_info_ast_bw.text_hash != symbol.borrow().get_processed_text_hash(){
+                        warn!("[LOG B - CACHE] Hash mismatch for {}: ast={} cached={}", 
+                              symbol.borrow().paths().first().unwrap_or(&S!("unknown")),
+                              file_info_ast_bw.text_hash,
+                              symbol.borrow().get_processed_text_hash());
                         symbol.borrow_mut().set_build_status(BuildSteps::ARCH_EVAL, BuildStatus::INVALID);
                         return;
                     }
@@ -137,6 +142,7 @@ impl PythonArchEval {
         }
         let mut symbol = self.sym_stack[0].borrow_mut();
         symbol.set_build_status(BuildSteps::ARCH_EVAL, BuildStatus::DONE);
+        trace!("[LOG C - CACHE] eval_arch completed successfully for: {}", symbol.paths().first().unwrap_or(&S!("unknown")));
         if symbol.is_external() && (!self.file_mode  || !file_info_rc.borrow().opened) {
             if self.file_mode {
                 FileMgr::delete_path(session, &path);
