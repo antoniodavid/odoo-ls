@@ -84,8 +84,17 @@ impl PythonArchEval {
             warn!("File info not found for {}", path);
             return;
         };
+        let is_external = symbol.borrow().is_external();
+        let is_opened = file_info_rc.borrow().opened;
+        
         if file_info_rc.borrow().file_info_ast.borrow().indexed_module.is_none() {
-            file_info_rc.borrow_mut().prepare_ast(session);
+            if !is_external || is_opened {
+                file_info_rc.borrow_mut().prepare_ast(session);
+            } else {
+                trace!("[LAZY] Skipping AST load for external closed file: {}", path);
+                symbol.borrow_mut().set_build_status(BuildSteps::ARCH_EVAL, BuildStatus::DONE);
+                return;
+            }
         }
         let file_info = (*file_info_rc).borrow();
         let file_info_ast = file_info.file_info_ast.clone();
@@ -140,15 +149,19 @@ impl PythonArchEval {
             symbol.borrow_mut().as_func_mut().replace_diagnostics(BuildSteps::ARCH_EVAL, self.diagnostics.clone());
             PythonArchEvalHooks::on_function_eval(session, &self.entry_point, symbol.clone());
         }
+        let is_external_file = self.sym_stack[0].borrow().is_external();
+        let is_file_opened = file_info_rc.borrow().opened;
+        
         let mut symbol = self.sym_stack[0].borrow_mut();
         symbol.set_build_status(BuildSteps::ARCH_EVAL, BuildStatus::DONE);
         trace!("[LOG C - CACHE] eval_arch completed successfully for: {}", symbol.paths().first().unwrap_or(&S!("unknown")));
-        if symbol.is_external() && (!self.file_mode  || !file_info_rc.borrow().opened) {
+        drop(symbol);
+        
+        if is_external_file && (!self.file_mode  || !is_file_opened) {
             if self.file_mode {
                 FileMgr::delete_path(session, &path);
             }
         } else {
-            drop(symbol);
             if self.file_mode {
                 session.sync_odoo.add_to_validations(self.sym_stack[0].clone());
             }
