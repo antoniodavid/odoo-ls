@@ -1,3 +1,4 @@
+pub mod cache;
 pub mod config;
 pub mod csv_arch_builder;
 pub mod diagnostics;

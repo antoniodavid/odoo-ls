@@ -7,10 +7,12 @@ use tracing::{error, warn};
 use std::collections::hash_map::DefaultHasher;
 use std::collections::HashSet;
 use std::hash::{Hash, Hasher};
+use std::num::NonZeroUsize;
 use std::path::PathBuf;
 use std::str::FromStr;
 use std::sync::{atomic::{AtomicBool, Ordering}, Arc, OnceLock};
 use std::{collections::HashMap, fs};
+use lru::LruCache;
 use crate::core::config::{DiagnosticFilter, DiagnosticFilterPathType};
 use crate::core::diagnostics::{create_diagnostic, DiagnosticCode, DiagnosticSetting};
 use crate::core::text_document::TextDocument;
@@ -76,6 +78,15 @@ impl FileInfoAst {
     pub fn get_stmts(&self) -> Option<&Vec<Stmt>> {
         self.indexed_module.as_ref().map(|module| &module.parsed.syntax().body)
     }
+
+    pub fn evict(&mut self) {
+        self.text_document = None;
+        self.indexed_module = None;
+    }
+
+    pub fn is_evicted(&self) -> bool {
+        self.indexed_module.is_none()
+    }
 }
 
 #[derive(Debug)]
@@ -86,6 +97,7 @@ pub struct FileInfo {
     pub opened: bool,
     need_push: bool,
     pub file_info_ast: Rc<RefCell<FileInfoAst>>,
+    pub last_modified: Option<u64>,
     diagnostics: HashMap<BuildSteps, Vec<Diagnostic>>,
     pub noqas_blocs: HashMap<u32, NoqaInfo>,
     noqas_lines: HashMap<u32, NoqaInfo>,
@@ -108,6 +120,7 @@ impl FileInfo {
                 indexed_module: None,
                 ast_type: AstType::Python,
             })),
+            last_modified: None,
             diagnostics: HashMap::new(),
             noqas_blocs: HashMap::new(),
             noqas_lines: HashMap::new(),
@@ -238,6 +251,14 @@ impl FileInfo {
         self.file_info_ast.borrow().text_document.clone().unwrap().hash(&mut hasher);
         self.file_info_ast.borrow_mut().text_hash = hasher.finish();
         self._build_ast(session, session.sync_odoo.get_file_mgr().borrow().is_in_workspace(&self.uri));
+    }
+
+    pub fn evict_ast(&mut self) {
+        self.file_info_ast.borrow_mut().evict();
+    }
+
+    pub fn is_ast_loaded(&self) -> bool {
+        !self.file_info_ast.borrow().is_evicted()
     }
 
     fn extract_tokens(&mut self, parsed_module: &Parsed<ModModule>, source: &String, encoding: PositionEncoding, parse_test_comments: bool) {
@@ -474,12 +495,15 @@ impl FileInfo {
     }
 }
 
+const AST_LRU_CACHE_SIZE: usize = 512;
+
 #[derive(Debug)]
 pub struct FileMgr {
     pub files: HashMap<String, Rc<RefCell<FileInfo>>>,
-    untitled_files: HashMap<String, Rc<RefCell<FileInfo>>>, // key: untitled URI or unique name
+    untitled_files: HashMap<String, Rc<RefCell<FileInfo>>>,
     workspace_folders: HashMap<String, String>,
     has_repeated_workspace_folders: bool,
+    ast_lru: LruCache<String, ()>,
 }
 
 impl FileMgr {
@@ -490,6 +514,7 @@ impl FileMgr {
             untitled_files: HashMap::new(),
             workspace_folders: HashMap::new(),
             has_repeated_workspace_folders: false,
+            ast_lru: LruCache::new(NonZeroUsize::new(AST_LRU_CACHE_SIZE).unwrap()),
         }
     }
 
@@ -684,6 +709,28 @@ impl FileMgr {
             }
         }
         false
+    }
+
+    fn is_external_path(path: &str) -> bool {
+        path.contains("/typeshed/") ||
+        path.contains("/site-packages/") ||
+        path.contains("/lib/python") ||
+        path.contains("/lib-dynload/") ||
+        path.contains("/mise/installs/python/")
+    }
+
+    pub fn evict_all_external_asts(&mut self) -> usize {
+        let mut evicted_count = 0;
+        for (path, file_info) in self.files.iter() {
+            if Self::is_external_path(path) && !file_info.borrow().opened {
+                if file_info.borrow().is_ast_loaded() {
+                    file_info.borrow_mut().evict_ast();
+                    evicted_count += 1;
+                }
+            }
+        }
+        self.ast_lru.clear();
+        evicted_count
     }
 
     pub fn pathname2uri(s: &String) -> lsp_types::Uri {
