@@ -686,6 +686,16 @@ impl ModuleSymbol {
         }
     }
 
+    pub fn populate_files_from_cache(&mut self, cached: &CachedModule, module_symbol_rc: Rc<RefCell<Symbol>>) {
+        use crate::core::cache::restore_file_from_cache;
+        
+        for cached_file in &cached.files {
+            let file_rc = restore_file_from_cache(cached_file, module_symbol_rc.clone(), self.is_external);
+            let name = file_rc.borrow().name().clone();
+            self.module_symbols.insert(name, file_rc);
+        }
+    }
+
     pub fn to_cached_module(&self, session: &SessionInfo) -> CachedModule {
         let mut cached_models = Vec::new();
 
@@ -774,10 +784,27 @@ impl ModuleSymbol {
             data: self.data.iter().map(|(d, _)| d.clone()).collect(),
             file_hashes,
             models: cached_models,
-            xml_ids: HashMap::new(), // Future work: Populate XML IDs
+            xml_ids: HashMap::new(),
             is_external: self.is_external,
             processed_text_hash: self.processed_text_hash,
+            files: self.collect_cached_files(session),
         }
+    }
+
+    fn collect_cached_files(&self, _session: &SessionInfo) -> Vec<crate::core::cache::CachedFile> {
+        use crate::core::cache::CachedFile;
+        use crate::constants::SymType;
+        
+        let mut cached_files = Vec::new();
+        
+        for (_name, file_sym_rc) in self.module_symbols.iter() {
+            let file_sym = file_sym_rc.borrow();
+            if file_sym.typ() == SymType::FILE {
+                cached_files.push(CachedFile::from_file_symbol(file_sym.as_file()));
+            }
+        }
+        
+        cached_files
     }
 
 }

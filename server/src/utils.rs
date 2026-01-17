@@ -4,14 +4,19 @@ use regex::Regex;
 use ruff_text_size::TextSize;
 use std::process::Command;
 use std::sync::atomic::Ordering;
-use std::{collections::HashMap, fs::{self, DirEntry}, path::{Path, PathBuf}, str::FromStr, sync::LazyLock};
+use std::{
+    collections::HashMap,
+    fs::{self, DirEntry},
+    path::{Path, PathBuf},
+    str::FromStr,
+    sync::LazyLock,
+};
 
 use crate::{constants::Tree, oyarn};
 
-static TEMPLATE_REGEX: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"\$\{([^}]+)\}").unwrap()
-});
-static HOME_DIR: LazyLock<Option<String>> = LazyLock::new(|| dirs::home_dir().map(|buf| buf.sanitize()));
+static TEMPLATE_REGEX: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"\$\{([^}]+)\}").unwrap());
+static HOME_DIR: LazyLock<Option<String>> =
+    LazyLock::new(|| dirs::home_dir().map(|buf| buf.sanitize()));
 
 #[macro_export]
 macro_rules! S {
@@ -105,12 +110,8 @@ pub fn is_dir_cs(path: String) -> bool {
 //TODO use it?
 pub fn is_symlink_cs(path: String) -> bool {
     match fs::canonicalize(path) {
-        Ok(canonical_path) => {
-            fs::metadata(canonical_path).unwrap().is_symlink()
-        }
-        Err(_err) => {
-            false
-        }
+        Ok(canonical_path) => fs::metadata(canonical_path).unwrap().is_symlink(),
+        Err(_err) => false,
     }
 }
 
@@ -156,8 +157,9 @@ pub trait PathSanitizer {
 }
 
 impl PathSanitizer for PathBuf {
-
     fn sanitize(&self) -> String {
+        let _path = self.to_slash_lossy().to_string();
+
         #[cfg(windows)]
         {
             let mut path = self.to_slash_lossy().to_string();
@@ -183,9 +185,19 @@ impl PathSanitizer for PathBuf {
     fn to_tree(&self) -> Tree {
         let mut tree = (vec![], vec![]);
         self.components().for_each(|c| {
-            tree.0.push(oyarn!("{}", c.as_os_str().to_str().unwrap().replace(".py", "").replace(".pyi", "")));
+            tree.0.push(oyarn!(
+                "{}",
+                c.as_os_str()
+                    .to_str()
+                    .unwrap()
+                    .replace(".py", "")
+                    .replace(".pyi", "")
+            ));
         });
-        if matches!(tree.0.last().map(|s| s.as_str()), Some("__init__" | "__manifest__")) {
+        if matches!(
+            tree.0.last().map(|s| s.as_str()),
+            Some("__init__" | "__manifest__")
+        ) {
             tree.0.pop();
         }
         tree
@@ -194,7 +206,9 @@ impl PathSanitizer for PathBuf {
     /// Convert the path to a path valid for the tree structure (without __init__.py or __manifest__.py).
     fn to_tree_path(&self) -> PathBuf {
         if let Some(file_name) = self.file_name() {
-            if file_name.to_str().unwrap() == "__init__.py" || file_name.to_str().unwrap() == "__manifest__.py" {
+            if file_name.to_str().unwrap() == "__init__.py"
+                || file_name.to_str().unwrap() == "__manifest__.py"
+            {
                 return self.parent().unwrap().to_path_buf();
             }
         }
@@ -203,8 +217,9 @@ impl PathSanitizer for PathBuf {
 }
 
 impl PathSanitizer for Path {
-
     fn sanitize(&self) -> String {
+        let _path = self.to_slash_lossy().to_string();
+
         #[cfg(windows)]
         {
             let mut path = self.to_slash_lossy().to_string();
@@ -226,9 +241,19 @@ impl PathSanitizer for Path {
     fn to_tree(&self) -> Tree {
         let mut tree = (vec![], vec![]);
         self.components().for_each(|c| {
-            tree.0.push(oyarn!("{}", c.as_os_str().to_str().unwrap().replace(".py", "").replace(".pyi", "")));
+            tree.0.push(oyarn!(
+                "{}",
+                c.as_os_str()
+                    .to_str()
+                    .unwrap()
+                    .replace(".py", "")
+                    .replace(".pyi", "")
+            ));
         });
-        if matches!(tree.0.last().map(|s| s.as_str()), Some("__init__" | "__manifest__")) {
+        if matches!(
+            tree.0.last().map(|s| s.as_str()),
+            Some("__init__" | "__manifest__")
+        ) {
             tree.0.pop();
         }
         tree
@@ -237,7 +262,9 @@ impl PathSanitizer for Path {
     /// Convert the path to a path valid for the tree structure (without __init__.py or __manifest__.py).
     fn to_tree_path(&self) -> PathBuf {
         if let Some(file_name) = self.file_name() {
-            if file_name.to_str().unwrap() == "__init__.py" || file_name.to_str().unwrap() == "__manifest__.py" {
+            if file_name.to_str().unwrap() == "__init__.py"
+                || file_name.to_str().unwrap() == "__manifest__.py"
+            {
                 return self.parent().unwrap().to_path_buf();
             }
         }
@@ -260,7 +287,7 @@ pub fn has_template(template: &str) -> bool {
 pub fn fill_template(template: &str, vars: &HashMap<String, String>) -> Result<String, String> {
     let mut invalid = None;
 
-    let result = TEMPLATE_REGEX.replace_all(template, |captures: &regex::Captures| -> String{
+    let result = TEMPLATE_REGEX.replace_all(template, |captures: &regex::Captures| -> String {
         let key = captures[1].to_string();
         if let Some(value) = vars.get(&key) {
             value.clone()
@@ -275,50 +302,66 @@ pub fn fill_template(template: &str, vars: &HashMap<String, String>) -> Result<S
     }
 }
 
-
 pub fn build_pattern_map(ws_folders: &HashMap<String, String>) -> HashMap<String, String> {
     // TODO: Maybe cache this
     let mut pattern_map = HashMap::new();
     if let Some(home_dir) = HOME_DIR.as_ref() {
         pattern_map.insert(S!("userHome"), home_dir.clone());
     }
-    for (ws_name, ws_path) in ws_folders.iter(){
-        pattern_map.insert(format!("workspaceFolder:{}", ws_name.clone()), ws_path.clone());
+    for (ws_name, ws_path) in ws_folders.iter() {
+        pattern_map.insert(
+            format!("workspaceFolder:{}", ws_name.clone()),
+            ws_path.clone(),
+        );
     }
     pattern_map
 }
-
 
 /// Fill the template with the given pattern map.
 /// While also checking it with the predicate function.
 /// pass `|_| true` to skip the predicate check.
 /// Currently, only the workspaceFolder[:workspace_name] and userHome variables are supported.
-pub fn fill_validate_path<F, P>(ws_folders: &HashMap<String, String>, workspace_name: Option<&String>, template: &str, predicate: F, var_map: HashMap<String, String>, parent_path: P) -> Result<String, String>
+pub fn fill_validate_path<F, P>(
+    ws_folders: &HashMap<String, String>,
+    workspace_name: Option<&String>,
+    template: &str,
+    predicate: F,
+    var_map: HashMap<String, String>,
+    parent_path: P,
+) -> Result<String, String>
 where
     F: Fn(&String) -> bool,
-    P: AsRef<Path>
+    P: AsRef<Path>,
 {
-        let mut pattern_map: HashMap<String, String> = build_pattern_map(ws_folders).into_iter().chain(var_map.into_iter()).collect();
-        if let Some(path) = workspace_name.and_then(|name| ws_folders.get(name)) {
-            pattern_map.insert(S!("workspaceFolder"), path.clone());
-        }
-        let path = fill_template(template, &pattern_map)?;
-        if predicate(&path) {
-            return Ok(path);
-        }
-        // Attempt to convert the path to an absolute path
-        if let Ok(abs_path) = std::fs::canonicalize(parent_path.as_ref().join(&path)) {
-            let abs_path    = abs_path.sanitize();
-            if predicate(&abs_path) {
-                return Ok(abs_path);
-            }
-        }
-        Err(format!("Failed to fill and validate path: {} from template {}", path, template))
+    let mut pattern_map: HashMap<String, String> = build_pattern_map(ws_folders)
+        .into_iter()
+        .chain(var_map.into_iter())
+        .collect();
+    if let Some(path) = workspace_name.and_then(|name| ws_folders.get(name)) {
+        pattern_map.insert(S!("workspaceFolder"), path.clone());
     }
+    let path = fill_template(template, &pattern_map)?;
+    if predicate(&path) {
+        return Ok(path);
+    }
+    // Attempt to convert the path to an absolute path
+    if let Ok(abs_path) = std::fs::canonicalize(parent_path.as_ref().join(&path)) {
+        let abs_path = abs_path.sanitize();
+        if predicate(&abs_path) {
+            return Ok(abs_path);
+        }
+    }
+    Err(format!(
+        "Failed to fill and validate path: {} from template {}",
+        path, template
+    ))
+}
 
 fn is_really_module(directory_path: &str, entry: &DirEntry) -> bool {
     let module_name = entry.file_name();
-    let full_path = Path::new(directory_path).join(module_name).join("__manifest__.py");
+    let full_path = Path::new(directory_path)
+        .join(module_name)
+        .join("__manifest__.py");
 
     // Check if the file exists and is a regular file
     full_path.exists() && full_path.is_file()
@@ -326,10 +369,10 @@ fn is_really_module(directory_path: &str, entry: &DirEntry) -> bool {
 
 pub fn is_addon_path(directory_path: &String) -> bool {
     fs::read_dir(directory_path)
-    .into_iter()
-    .flatten()
-    .flatten()
-    .any(|entry| is_really_module(directory_path, &entry))
+        .into_iter()
+        .flatten()
+        .flatten()
+        .any(|entry| is_really_module(directory_path, &entry))
 }
 
 pub fn is_odoo_path(directory_path: &String) -> bool {

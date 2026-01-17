@@ -606,6 +606,9 @@ impl SyncOdoo {
                                                         if let Symbol::Package(PackageSymbol::Module(ref mut m)) = *module_rc.borrow_mut() {
                                                             m.populate_models_from_cache(session, &cached_module, module_rc.clone());
                                                         }
+                                                        if let Symbol::Package(PackageSymbol::Module(ref mut m)) = *module_rc.borrow_mut() {
+                                                            m.populate_files_from_cache(&cached_module, module_rc.clone());
+                                                        }
 
                                                         info!("Loaded module {} from cache", item.file_name().to_str().unwrap());
                                                         loaded_from_cache = true;
