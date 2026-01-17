@@ -827,7 +827,7 @@ impl Symbol {
         }
     }
 
-    fn set_parent(&mut self, parent: Option<Weak<RefCell<Symbol>>>) {
+    pub fn set_parent(&mut self, parent: Option<Weak<RefCell<Symbol>>>) {
         match self {
             Symbol::Root(_) => panic!(),
             Symbol::Namespace(n) => n.parent = parent,
@@ -1886,7 +1886,7 @@ impl Symbol {
         Symbol::is_symbol_in_parents(&parent, to_test)
     }
 
-    fn set_weak_self(&mut self, weak_self: Weak<RefCell<Symbol>>) {
+    pub fn set_weak_self(&mut self, weak_self: Weak<RefCell<Symbol>>) {
         match self {
             Symbol::Root(r) => r.weak_self = Some(weak_self),
             Symbol::Namespace(n) => n.weak_self = Some(weak_self),

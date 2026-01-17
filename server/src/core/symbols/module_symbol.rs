@@ -15,6 +15,7 @@ use crate::core::file_mgr::{FileInfo, FileMgr, NoqaInfo};
 use crate::core::import_resolver::find_module;
 use crate::core::model::Model;
 use crate::core::odoo::SyncOdoo;
+use crate::core::cache::{CachedModule, CachedModel, CachedField};
 use crate::core::symbols::symbol::Symbol;
 use crate::core::symbols::symbol_mgr::SymbolMgr;
 use crate::threads::SessionInfo;
@@ -587,6 +588,196 @@ impl ModuleSymbol {
             }
         }
         res
+    }
+
+    pub fn from_cached_module(cached: &CachedModule) -> Option<Self> {
+        let mut module = ModuleSymbol {
+            name: oyarn!("{}", cached.name),
+            path: cached.path.clone(),
+            i_ext: S!(""),
+            is_external: cached.is_external,
+            not_found_paths: vec![],
+            not_found_data: HashMap::new(),
+            not_found_models: HashMap::new(),
+            in_workspace: false,
+            root_path: cached.path.clone(),
+            loaded: true,
+            module_name: oyarn!("{}", cached.module_name),
+            xml_id_locations: HashMap::new(),
+            xml_ids: HashMap::new(),
+            dir_name: oyarn!("{}", cached.dir_name),
+            depends: cached.depends.iter().map(|d| (oyarn!("{}", d), TextRange::default())).collect(),
+            all_depends: cached.all_depends.iter().map(|d| oyarn!("{}", d)).collect(),
+            data: cached.data.iter().map(|d| (d.clone(), TextRange::default())).collect(),
+            weak_self: None,
+            parent: None,
+            module_symbols: HashMap::new(),
+            arch_status: BuildStatus::DONE,
+            arch_eval_status: BuildStatus::DONE,
+            validation_status: BuildStatus::DONE,
+            sections: vec![],
+            symbols: HashMap::new(),
+            ext_symbols: HashMap::new(),
+            decl_ext_symbols: PtrWeakKeyHashMap::new(),
+            model_dependencies: PtrWeakHashSet::new(),
+            dependencies: vec![],
+            dependents: vec![],
+            processed_text_hash: cached.processed_text_hash,
+            noqas: NoqaInfo::None,
+            data_symbols: HashMap::new(),
+        };
+        module._init_symbol_mgr();
+        Some(module)
+    }
+
+    pub fn populate_models_from_cache(&mut self, session: &mut SessionInfo, cached: &CachedModule, module_symbol_rc: Rc<RefCell<Symbol>>) {
+        for cached_model in &cached.models {
+            let model_name = oyarn!("{}", cached_model.name);
+            let range = TextRange::default();
+            let mut class_symbol = crate::core::symbols::class_symbol::ClassSymbol::new(
+                cached_model.name.clone(), 
+                range, 
+                0.into(), 
+                self.is_external
+            );
+            
+            let mut model_data = crate::core::model::ModelData::new();
+            model_data.name = model_name.clone();
+            model_data.description = cached_model.description.clone();
+            model_data.inherit = cached_model.inherit.iter().map(|s| oyarn!("{}", s)).collect();
+            model_data.inherits = cached_model.inherits.iter().map(|(k, v)| (oyarn!("{}", k), oyarn!("{}", v))).collect();
+            model_data.is_abstract = cached_model.is_abstract;
+            model_data.transient = cached_model.transient;
+            model_data.table = cached_model.table.clone();
+            model_data.rec_name = cached_model.rec_name.clone();
+            model_data.order = cached_model.order.clone();
+            model_data.auto = cached_model.auto;
+            model_data.log_access = cached_model.log_access;
+            model_data.parent_name = cached_model.parent_name.clone();
+            model_data.active_name = cached_model.active_name.clone();
+            
+            class_symbol._model = Some(model_data);
+            
+            for cached_field in &cached_model.fields {
+                let field_name = oyarn!("{}", cached_field.name);
+                let variable_symbol = crate::core::symbols::variable_symbol::VariableSymbol::new(
+                    field_name.clone(),
+                    TextRange::default(),
+                    self.is_external
+                );
+                let variable_rc = Rc::new(RefCell::new(Symbol::Variable(variable_symbol)));
+                variable_rc.borrow_mut().set_weak_self(Rc::downgrade(&variable_rc));
+                
+                let sections = class_symbol.symbols.entry(field_name).or_insert(HashMap::new());
+                let section_vec = sections.entry(0).or_insert(vec![]);
+                section_vec.push(variable_rc);
+            }
+
+            let class_rc = Rc::new(RefCell::new(Symbol::Class(class_symbol)));
+            class_rc.borrow_mut().set_weak_self(Rc::downgrade(&class_rc));
+            class_rc.borrow_mut().set_parent(Some(Rc::downgrade(&module_symbol_rc)));
+            
+            self.module_symbols.insert(oyarn!("{}", cached_model.name), class_rc.clone());
+            
+            let model_rc = session.sync_odoo.models.entry(model_name.clone()).or_insert_with(|| {
+                Rc::new(RefCell::new(crate::core::model::Model::new(model_name.clone(), class_rc.clone())))
+            }).clone();
+            model_rc.borrow_mut().add_symbol_with_module(session, class_rc.clone(), Some(module_symbol_rc.clone()));
+        }
+    }
+
+    pub fn to_cached_module(&self, session: &SessionInfo) -> CachedModule {
+        let mut cached_models = Vec::new();
+
+        // Iterate over all symbols in the module to find classes that define models
+        for sections in self.symbols.values() {
+            for symbols in sections.values() {
+                for symbol_rc in symbols {
+                    let symbol = symbol_rc.borrow();
+                    if let SymType::CLASS = symbol.typ() {
+                        let class_sym = symbol.as_class_sym();
+                        if let Some(model_data) = &class_sym._model {
+                            // Convert fields
+                            let mut cached_fields = Vec::new();
+                            for field_sections in class_sym.symbols.values() {
+                                for field_symbols in field_sections.values() {
+                                    for field_sym_rc in field_symbols {
+                                        let field_sym = field_sym_rc.borrow();
+                                        // Check if it's a variable (potential field)
+                                        if let SymType::VARIABLE = field_sym.typ() {
+                                            // For now, we only capture the name. 
+                                            // Type inference requires evaluation which is complex to serialize.
+                                            cached_fields.push(CachedField {
+                                                name: field_sym.name().to_string(),
+                                                field_type: "Unknown".to_string(), 
+                                                string: None,
+                                                required: false,
+                                                readonly: false,
+                                                compute: None,
+                                                inverse: None,
+                                                related: None,
+                                                default: None,
+                                                store: true,
+                                                help: None,
+                                                translate: false,
+                                            });
+                                        }
+                                    }
+                                }
+                            }
+
+                            cached_models.push(CachedModel {
+                                name: model_data.name.to_string(),
+                                description: model_data.description.clone(),
+                                inherit: model_data.inherit.iter().map(|s| s.to_string()).collect(),
+                                inherits: model_data.inherits.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect(),
+                                fields: cached_fields,
+                                is_abstract: model_data.is_abstract,
+                                transient: model_data.transient,
+                                table: model_data.table.clone(),
+                                rec_name: model_data.rec_name.clone(),
+                                order: model_data.order.clone(),
+                                auto: model_data.auto,
+                                log_access: model_data.log_access,
+                                parent_name: model_data.parent_name.clone(),
+                                active_name: model_data.active_name.clone(),
+                            });
+                        }
+                    }
+                }
+            }
+        }
+
+        // Collect file hashes for validation
+        let mut file_hashes = HashMap::new();
+        // We iterate over files in the file manager that belong to this module
+        {
+            let file_mgr = session.sync_odoo.get_file_mgr();
+            let file_mgr = file_mgr.borrow();
+            for (path, file_info) in file_mgr.files.iter() {
+                if path.starts_with(&self.path) {
+                    // Use last_modified as a proxy for hash
+                     if let Some(mtime) = file_info.borrow().last_modified {
+                         file_hashes.insert(path.clone(), mtime);
+                     }
+                }
+            }
+        }
+
+        CachedModule {
+            name: self.name.to_string(),
+            path: self.path.clone(),
+            dir_name: self.dir_name.to_string(),
+            module_name: self.module_name.to_string(),
+            depends: self.depends.iter().map(|(d, _)| d.to_string()).collect(),
+            all_depends: self.all_depends.iter().map(|d| d.to_string()).collect(),
+            data: self.data.iter().map(|(d, _)| d.clone()).collect(),
+            file_hashes,
+            models: cached_models,
+            xml_ids: HashMap::new(), // Future work: Populate XML IDs
+            is_external: self.is_external,
+            processed_text_hash: self.processed_text_hash,
+        }
     }
 
 }

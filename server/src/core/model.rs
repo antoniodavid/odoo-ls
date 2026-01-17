@@ -96,6 +96,17 @@ impl Model {
         self.add_dependents_to_validation(session, from_module);
     }
 
+    /// Add a symbol to the model with an explicit module reference.
+    /// This avoids calling find_module() which can cause borrow issues when
+    /// the parent module is already borrowed.
+    pub fn add_symbol_with_module(&mut self, session: &mut SessionInfo, symbol: Rc<RefCell<Symbol>>, from_module: Option<Rc<RefCell<Symbol>>>) {
+        if self.symbols.contains(&symbol) {
+            return;
+        }
+        self.symbols.insert(symbol.clone());
+        self.add_dependents_to_validation(session, from_module);
+    }
+
     pub fn remove_symbol(&mut self, session: &mut SessionInfo, symbol: &Rc<RefCell<Symbol>>, from_module: Option<Rc<RefCell<Symbol>>>) {
         self.symbols.remove(symbol);
         self.add_dependents_to_validation(session, from_module);

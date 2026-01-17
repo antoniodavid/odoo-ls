@@ -37,6 +37,9 @@ use regex::Regex;
 use crate::{constants::*, oyarn, Sy};
 use super::config::{self, default_profile_name, get_configuration, ConfigEntry, ConfigFile};
 use super::entry_point::{EntryPoint, EntryPointMgr};
+use crate::core::cache::{get_file_metadata, CacheData, CacheManager};
+use super::symbols::module_symbol::ModuleSymbol;
+use super::symbols::package_symbol::PackageSymbol;
 use super::file_mgr::FileMgr;
 use super::import_resolver::ImportCache;
 use super::symbols::symbol::Symbol;
@@ -99,6 +102,8 @@ pub struct SyncOdoo {
     pub capabilities: lsp_types::ClientCapabilities,
     pub encoding: PositionEncoding,
     pub opened_files: Vec<String>,
+    pub file_metadata_cache: Option<CacheData>,
+    pub module_cache_manager: Option<crate::core::cache::ModuleCacheManager>,
 
     pub test_mode: bool,
 }
@@ -145,6 +150,8 @@ impl SyncOdoo {
             capabilities: lsp_types::ClientCapabilities::default(),
             encoding: PositionEncoding::Utf16,
             opened_files: vec![],
+            file_metadata_cache: None,
+            module_cache_manager: crate::core::cache::ModuleCacheManager::new(),
 
             test_mode: false,
         };
@@ -322,12 +329,76 @@ impl SyncOdoo {
 
     pub fn build_database(session: &mut SessionInfo) {
         session.log_message(MessageType::INFO, String::from("Building Database"));
+
+        SyncOdoo::load_file_cache(session);
         let result = SyncOdoo::build_base(session);
         if result {
             SyncOdoo::build_modules(session);
         }
     }
 
+
+    fn load_file_cache(session: &mut SessionInfo) {
+        let odoo_path = match session.sync_odoo.config.odoo_path.as_ref() {
+            Some(p) => p.clone(),
+            None => return,
+        };
+
+        let cache_manager = match CacheManager::new() {
+            Some(cm) => cm,
+            None => return,
+        };
+
+        if let Some(cache) = cache_manager.load(&odoo_path) {
+            info!("Loaded file metadata cache with {} entries", cache.files.len());
+            session.sync_odoo.file_metadata_cache = Some(cache);
+        }
+    }
+
+    fn save_file_cache(session: &mut SessionInfo) {
+        let odoo_path = match session.sync_odoo.config.odoo_path.as_ref() {
+            Some(p) => p.clone(),
+            None => return,
+        };
+
+        let cache_manager = match CacheManager::new() {
+            Some(cm) => cm,
+            None => return,
+        };
+
+        let mut cache = CacheData::new(&odoo_path);
+        let file_mgr = session.sync_odoo.get_file_mgr();
+        
+        for (path, _) in file_mgr.borrow().files.iter() {
+            if let Some(metadata) = get_file_metadata(Path::new(path)) {
+                cache.files.insert(path.clone(), metadata);
+            }
+        }
+
+        cache_manager.save(&cache);
+    }
+
+    fn save_module_cache(session: &mut SessionInfo) {
+        if let Some(module_cache_manager) = &session.sync_odoo.module_cache_manager {
+            let odoo_path = match session.sync_odoo.config.odoo_path.as_ref() {
+                Some(p) => p.clone(),
+                None => return,
+            };
+
+            let modules_to_cache: Vec<_> = session.sync_odoo.modules.values()
+                .filter_map(|weak_ref| weak_ref.upgrade())
+                .collect();
+
+            let mut count = 0;
+            for module_rc in modules_to_cache {
+                let cached_module = module_rc.borrow().as_module_package().to_cached_module(session);
+                if module_cache_manager.save_module(&cached_module, &odoo_path) {
+                    count += 1;
+                }
+            }
+            info!("Saved module cache for {} modules", count);
+        }
+    }
     pub fn read_version(session: &mut SessionInfo, release_path: PathBuf) -> (u32, u32, u32) {
         let mut _version_major: u32 = 14;
         let mut _version_minor: u32 = 0;
@@ -493,9 +564,66 @@ impl SyncOdoo {
                         match item {
                             Ok(item) => {
                                 if item.file_type().unwrap().is_dir() && !session.sync_odoo.modules.contains_key(&oyarn!("{}", item.file_name().to_str().unwrap())) {
-                                    if let Some(module_symbol) = Symbol::create_from_path(session, &item.path(), addons_symbol.clone(), true) {
-                                        modules.push(module_symbol);
-                                    }
+                                        // Attempt to load from cache first
+                                        let mut loaded_from_cache = false;
+                                        let mut module_rc_opt: Option<Rc<RefCell<Symbol>>> = None;
+                                        let odoo_path = session.sync_odoo.config.odoo_path.clone().unwrap_or_default();
+                                        if let Some(cache_manager) = &session.sync_odoo.module_cache_manager {
+                                            if let Some(cached_module) = cache_manager.load_module(&item.file_name().to_str().unwrap().to_string(), &odoo_path) {
+                                                // Verify cache validity by checking file mtimes
+                                                let is_valid = cached_module.file_hashes.iter().all(|(path, mtime)| {
+                                                    if let Some(meta) = get_file_metadata(Path::new(path)) {
+                                                        meta.mtime == *mtime
+                                                    } else {
+                                                        false 
+                                                    }
+                                                });
+
+                                                if is_valid && cached_module.path == item.path().sanitize() {
+                                                    // Reconstruct module from cache
+                                                    if let Some(module) = ModuleSymbol::from_cached_module(&cached_module) {
+                                                        // We need to wrap it in Symbol::Package and register it
+                                                        let module_rc = Rc::new(RefCell::new(Symbol::Package(PackageSymbol::Module(module))));
+                                                        
+                                                        // Register in session modules
+                                                        session.sync_odoo.modules.insert(oyarn!("{}", cached_module.dir_name), Rc::downgrade(&module_rc));
+                                                        
+                                                        // Add to addons symbol (parent)
+                                                        match *addons_symbol.borrow_mut() {
+                                                            Symbol::Package(ref mut p) => p.add_file(&module_rc),
+                                                            Symbol::DiskDir(ref mut d) => d.add_file(&module_rc),
+                                                            Symbol::Namespace(ref mut n) => n.add_file(&module_rc),
+                                                            _ => warn!("Addons symbol is not a container"),
+                                                        }
+
+                                                        // Set weak self and parent
+                                                        module_rc.borrow_mut().set_weak_self(Rc::downgrade(&module_rc));
+                                                        module_rc.borrow_mut().set_parent(Some(Rc::downgrade(&addons_symbol)));
+
+                                                        // NOTE: The cache methods populate_models_from_cache_static are not in [FIX] Caching yet, 
+                                                        // they were added in "implement module cache with ARCH_EVAL support". 
+                                                        // But let us use what we need for [FIX] Caching:
+                                                        if let Symbol::Package(PackageSymbol::Module(ref mut m)) = *module_rc.borrow_mut() {
+                                                            m.populate_models_from_cache(session, &cached_module, module_rc.clone());
+                                                        }
+
+                                                        info!("Loaded module {} from cache", item.file_name().to_str().unwrap());
+                                                        loaded_from_cache = true;
+                                                        module_rc_opt = Some(module_rc);
+                                                    }
+                                                }
+                                            }
+                                        }
+
+                                        if !loaded_from_cache {
+                                            if let Some(module_symbol) = Symbol::create_from_path(session, &item.path(), addons_symbol.clone(), true) {
+                                                module_rc_opt = Some(module_symbol);
+                                            }
+                                        }
+                                        
+                                        if let Some(module_rc) = module_rc_opt {
+                                            modules.push(module_rc);
+                                        }
                                 }
                             },
                             Err(_) => {}
@@ -517,6 +645,8 @@ impl SyncOdoo {
         info!("End building modules. {} modules loaded", modules_count);
         session.log_message(MessageType::INFO, format!("End building modules. {} modules loaded", modules_count));
         session.sync_odoo.state_init = InitState::ODOO_READY;
+        SyncOdoo::save_file_cache(session);
+        SyncOdoo::save_module_cache(session);
     }
 
     /// Sort modules by load order

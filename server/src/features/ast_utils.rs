@@ -64,7 +64,7 @@ impl AstUtils {
                 n.id.to_string()
             },
             Expr::Attribute(a) => {
-                AstUtils::flatten_expr(&a.value) + &a.attr
+                AstUtils::flatten_expr(&a.value) + "." + &a.attr
             },
             _ => {S!("//Unhandled//")}
         }
