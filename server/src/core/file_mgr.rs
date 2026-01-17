@@ -64,6 +64,96 @@ pub enum AstType {
     Csv
 }
 
+#[derive(Debug)]
+pub struct AstCacheManager {
+    persistent: HashMap<String, Arc<IndexedModule>>,
+    transient: HashMap<String, std::sync::Weak<IndexedModule>>,
+    lru: LruCache<String, ()>,
+    min_cache_size: usize,
+    max_cache_size: usize,
+}
+
+impl AstCacheManager {
+    pub fn new() -> Self {
+        Self {
+            persistent: HashMap::new(),
+            transient: HashMap::new(),
+            lru: LruCache::new(NonZeroUsize::new(500).unwrap()),
+            min_cache_size: 100,
+            max_cache_size: 500,
+        }
+    }
+
+    pub fn insert_persistent(&mut self, path: String, module: Arc<IndexedModule>) {
+        self.persistent.insert(path.clone(), module.clone());
+        self.lru.put(path, ());
+    }
+
+    pub fn insert_transient(&mut self, path: String, module: Arc<IndexedModule>) {
+        self.transient.insert(path.clone(), Arc::downgrade(&module));
+        self.lru.put(path, ());
+    }
+
+    pub fn get(&mut self, path: &str) -> Option<Arc<IndexedModule>> {
+        if let Some(module) = self.persistent.get(path) {
+            self.lru.get(path);
+            return Some(module.clone());
+        }
+        
+        if let Some(weak) = self.transient.get(path) {
+            if let Some(module) = weak.upgrade() {
+                self.lru.get(path);
+                return Some(module);
+            } else {
+                self.transient.remove(path);
+            }
+        }
+        
+        None
+    }
+
+    pub fn promote_to_persistent(&mut self, path: &str) {
+        if let Some(weak) = self.transient.remove(path) {
+            if let Some(module) = weak.upgrade() {
+                self.persistent.insert(path.to_string(), module);
+            }
+        }
+    }
+
+    pub fn demote_to_transient(&mut self, path: &str) {
+        if let Some(module) = self.persistent.remove(path) {
+            self.transient.insert(path.to_string(), Arc::downgrade(&module));
+        }
+    }
+
+    pub fn maybe_evict(&mut self) {
+        if self.lru.len() <= self.min_cache_size {
+            return;
+        }
+        
+        while self.lru.len() > self.max_cache_size {
+            if let Some((path, _)) = self.lru.pop_lru() {
+                if !self.persistent.contains_key(&path) {
+                    self.transient.remove(&path);
+                }
+            }
+        }
+        
+        self.transient.retain(|_, weak| weak.strong_count() != 0);
+    }
+
+    pub fn clear_transient(&mut self) {
+        self.transient.clear();
+    }
+
+    pub fn stats(&self) -> (usize, usize, usize) {
+        let transient_alive = self.transient.iter()
+            .filter(|(_, w)| w.strong_count() > 0)
+            .count();
+        (self.persistent.len(), transient_alive, self.lru.len())
+    }
+}
+
 /* Structure that hold ast and text_document for FileInfo. It allows Fileinfo to hold it with a Rc<RefCell<>> to allow mutability and build on-the-fly
  */
 #[derive(Debug)]
@@ -80,7 +170,6 @@ impl FileInfoAst {
     }
 
     pub fn evict(&mut self) {
-        self.text_document = None;
         self.indexed_module = None;
     }
 
@@ -237,6 +326,17 @@ impl FileInfo {
 
     /* if ast has been set to none to lower memory usage, try to reload it */
     pub fn prepare_ast(&mut self, session: &mut SessionInfo) {
+        // Try to get from cache first
+        let file_mgr = session.sync_odoo.get_file_mgr();
+        let cached_module = file_mgr.borrow().ast_cache.borrow_mut().get(&self.uri);
+        
+        if let Some(module) = cached_module {
+            // Cache hit - restore from cache
+            self.file_info_ast.borrow_mut().indexed_module = Some(module);
+            return;
+        }
+        
+        // Cache miss - need to rebuild
         if self.file_info_ast.borrow_mut().text_document.is_none() { //can already be set in xml files
             match fs::read_to_string(&self.uri) {
                 Ok(content) => {
@@ -250,7 +350,17 @@ impl FileInfo {
         let mut hasher = DefaultHasher::new();
         self.file_info_ast.borrow().text_document.clone().unwrap().hash(&mut hasher);
         self.file_info_ast.borrow_mut().text_hash = hasher.finish();
-        self._build_ast(session, session.sync_odoo.get_file_mgr().borrow().is_in_workspace(&self.uri));
+        let is_in_workspace = session.sync_odoo.get_file_mgr().borrow().is_in_workspace(&self.uri);
+        self._build_ast(session, is_in_workspace);
+        
+        if let Some(module) = &self.file_info_ast.borrow().indexed_module {
+            let file_mgr = session.sync_odoo.get_file_mgr();
+            if self.opened {
+                file_mgr.borrow().ast_cache.borrow_mut().insert_persistent(self.uri.clone(), module.clone());
+            } else {
+                file_mgr.borrow().ast_cache.borrow_mut().insert_transient(self.uri.clone(), module.clone());
+            }
+        }
     }
 
     pub fn evict_ast(&mut self) {
@@ -504,6 +614,7 @@ pub struct FileMgr {
     workspace_folders: HashMap<String, String>,
     has_repeated_workspace_folders: bool,
     ast_lru: LruCache<String, ()>,
+    pub ast_cache: Rc<RefCell<AstCacheManager>>,
 }
 
 impl FileMgr {
@@ -515,6 +626,7 @@ impl FileMgr {
             workspace_folders: HashMap::new(),
             has_repeated_workspace_folders: false,
             ast_lru: LruCache::new(NonZeroUsize::new(AST_LRU_CACHE_SIZE).unwrap()),
+            ast_cache: Rc::new(RefCell::new(AstCacheManager::new())),
         }
     }
 
@@ -624,6 +736,17 @@ impl FileMgr {
             drop(ep_mgr);
             updated = file_info_mut.update(session, uri, content, version, !is_part_of_ep, force, is_untitled);
             drop(file_info_mut);
+            
+            if updated {
+                if let Some(module) = &file_info.borrow().file_info_ast.borrow().indexed_module {
+                    let opened = file_info.borrow().opened;
+                    if opened {
+                        self.ast_cache.borrow_mut().insert_persistent(uri.to_string(), module.clone());
+                    } else {
+                        self.ast_cache.borrow_mut().insert_transient(uri.to_string(), module.clone());
+                    }
+                }
+            }
         }
         (updated, return_info)
     }
@@ -732,10 +855,10 @@ impl FileMgr {
         path.contains("/mise/installs/python/")
     }
 
-    pub fn evict_all_external_asts(&mut self) -> usize {
+    pub fn evict_all_closed_file_asts(&mut self) -> usize {
         let mut evicted_count = 0;
-        for (path, file_info) in self.files.iter() {
-            if Self::is_external_path(path) && !file_info.borrow().opened {
+        for (_path, file_info) in self.files.iter() {
+            if !file_info.borrow().opened {
                 if file_info.borrow().is_ast_loaded() {
                     file_info.borrow_mut().evict_ast();
                     evicted_count += 1;

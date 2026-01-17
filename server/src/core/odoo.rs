@@ -57,6 +57,14 @@ static VERSION_REGEX: std::sync::LazyLock<Regex> = std::sync::LazyLock::new(|| {
 
 #[allow(non_camel_case_types)]
 #[derive(Debug, PartialEq)]
+pub enum ProcessState {
+    NeedsMoreWork,
+    Complete,
+    Interrupted,
+}
+
+#[allow(non_camel_case_types)]
+#[derive(Debug, PartialEq)]
 pub enum InitState {
     NOT_READY,
     PYTHON_READY,
@@ -105,6 +113,9 @@ pub struct SyncOdoo {
     pub module_cache_manager: Option<crate::core::cache::ModuleCacheManager>,
 
     pub test_mode: bool,
+    already_arch_rebuilt: HashSet<Tree>,
+    already_arch_eval_rebuilt: HashSet<Tree>,
+    already_validation_rebuilt: HashSet<Tree>,
 }
 
 unsafe impl Send for SyncOdoo {}
@@ -152,6 +163,9 @@ impl SyncOdoo {
             module_cache_manager: crate::core::cache::ModuleCacheManager::new(),
 
             test_mode: false,
+            already_arch_rebuilt: HashSet::new(),
+            already_arch_eval_rebuilt: HashSet::new(),
+            already_validation_rebuilt: HashSet::new(),
         };
         sync_odoo
     }
@@ -1113,6 +1127,109 @@ impl SyncOdoo {
         );
     }
 
+    pub fn process_rebuilds_batch(
+        session: &mut SessionInfo,
+        batch_size: usize,
+        no_validation: bool,
+    ) -> ProcessState {
+        const MIN_BATCH_SIZE: usize = 10;
+        const MAX_BATCH_SIZE: usize = 500;
+        let effective_batch_size = batch_size.clamp(MIN_BATCH_SIZE, MAX_BATCH_SIZE);
+
+        if session.sync_odoo.terminate_rebuild.load(Ordering::SeqCst) {
+            return ProcessState::Interrupted;
+        }
+
+        let mut processed = 0;
+        while processed < effective_batch_size {
+            if session.sync_odoo.need_rebuild {
+                return ProcessState::Interrupted;
+            }
+
+            if session.sync_odoo.rebuild_arch.is_empty()
+                && session.sync_odoo.rebuild_arch_eval.is_empty()
+                && session.sync_odoo.rebuild_validation.is_empty()
+            {
+                return ProcessState::Complete;
+            }
+
+            let sym = session.sync_odoo.pop_item(BuildSteps::ARCH);
+            if let Some(sym_rc) = sym {
+                let (tree, entry) = sym_rc.borrow().get_tree_and_entry();
+                if session.sync_odoo.already_arch_rebuilt.contains(&tree) {
+                    continue;
+                }
+                session.sync_odoo.already_arch_rebuilt.insert(tree);
+                let mut builder = PythonArchBuilder::new(entry.unwrap(), sym_rc);
+                builder.load_arch(session);
+                processed += 1;
+                continue;
+            }
+
+            let sym = session.sync_odoo.pop_item(BuildSteps::ARCH_EVAL);
+            if let Some(sym_rc) = sym {
+                let (tree, entry) = sym_rc.borrow().get_tree_and_entry();
+                if session.sync_odoo.already_arch_eval_rebuilt.contains(&tree) {
+                    continue;
+                }
+                session.sync_odoo.already_arch_eval_rebuilt.insert(tree);
+                let mut builder = PythonArchEval::new(entry.unwrap(), sym_rc);
+                builder.eval_arch(session);
+                processed += 1;
+                continue;
+            }
+
+            let sym = session.sync_odoo.pop_item(BuildSteps::VALIDATION);
+            if let Some(sym_rc) = sym {
+                let (tree, entry) = sym_rc.borrow_mut().get_tree_and_entry();
+                if session.sync_odoo.already_validation_rebuilt.contains(&tree) {
+                    continue;
+                }
+                session.sync_odoo.already_validation_rebuilt.insert(tree);
+                if session.sync_odoo.state_init == InitState::ODOO_READY {
+                    if session.sync_odoo.interrupt_rebuild.load(Ordering::SeqCst) {
+                        session
+                            .sync_odoo
+                            .interrupt_rebuild
+                            .store(false, Ordering::SeqCst);
+                        session.log_message(MessageType::INFO, S!("Rebuild interrupted"));
+                        return ProcessState::Interrupted;
+                    }
+                    if no_validation {
+                        session.request_delayed_rebuild();
+                        session.sync_odoo.add_to_validations(sym_rc.clone());
+                        return ProcessState::Interrupted;
+                    }
+                }
+                let typ = sym_rc.borrow().typ();
+                match typ {
+                    SymType::XML_FILE => {
+                        let mut validator = XmlValidator::new(entry.as_ref().unwrap(), sym_rc);
+                        validator.validate(session);
+                    }
+                    _ => {
+                        let mut validator = PythonValidator::new(entry.unwrap(), sym_rc);
+                        validator.validate(session);
+                    }
+                }
+                processed += 1;
+                continue;
+            }
+        }
+
+        let file_mgr = session.sync_odoo.get_file_mgr();
+        let evicted = file_mgr.borrow_mut().evict_all_closed_file_asts();
+        if evicted > 0 {
+            trace!(
+                "Evicted {} closed file ASTs during batch processing",
+                evicted
+            );
+        }
+        file_mgr.borrow_mut().ast_cache.borrow_mut().maybe_evict();
+
+        ProcessState::NeedsMoreWork
+    }
+
     pub fn process_rebuilds(session: &mut SessionInfo, no_validation: bool) -> bool {
         session
             .sync_odoo
@@ -1128,8 +1245,15 @@ impl SyncOdoo {
         });
         let mut already_arch_rebuilt: HashSet<Tree> = HashSet::new();
         let mut already_arch_eval_rebuilt: HashSet<Tree> = HashSet::new();
+        let mut already_validation_rebuilt: HashSet<Tree> = HashSet::new();
 
-        //workdone progress
+        if session.sync_odoo.import_cache.is_none() {
+            session.sync_odoo.import_cache = Some(ImportCache {
+                modules: HashMap::new(),
+                main_modules: HashMap::new(),
+            });
+        }
+
         let mut last_update_status = Instant::now() - Duration::from_secs(10);
         let mut is_reporting_progress = false;
         if !session.sync_odoo.rebuild_arch.is_empty()
@@ -1139,25 +1263,17 @@ impl SyncOdoo {
             is_reporting_progress = true;
             SyncOdoo::start_reporting(session);
         }
+
         trace!(
             "Starting rebuild: {:?} - {:?} - {:?}",
             session.sync_odoo.rebuild_arch.len(),
             session.sync_odoo.rebuild_arch_eval.len(),
             session.sync_odoo.rebuild_validation.len()
         );
-        while !session.sync_odoo.need_rebuild
-            && (!session.sync_odoo.rebuild_arch.is_empty()
-                || !session.sync_odoo.rebuild_arch_eval.is_empty()
-                || !session.sync_odoo.rebuild_validation.is_empty())
-        {
-            if DEBUG_THREADS {
-                trace!(
-                    "remains: {:?} - {:?} - {:?}",
-                    session.sync_odoo.rebuild_arch.len(),
-                    session.sync_odoo.rebuild_arch_eval.len(),
-                    session.sync_odoo.rebuild_validation.len()
-                );
-            }
+
+        loop {
+            let state = SyncOdoo::process_rebuilds_batch(session, 100, no_validation);
+
             let queue_size = session.sync_odoo.rebuild_arch.len() * 3
                 + session.sync_odoo.rebuild_arch_eval.len() * 2
                 + session.sync_odoo.rebuild_validation.len();
@@ -1191,8 +1307,30 @@ impl SyncOdoo {
                 let (tree, entry) = sym_rc.borrow().get_tree_and_entry();
                 if already_arch_rebuilt.contains(&tree) {
                     info!("Already arch rebuilt, skipping");
+
+            match state {
+                ProcessState::Complete => {
+                    break;
+                }
+                ProcessState::Interrupted => {
+                    if is_reporting_progress {
+                        session.send_notification(
+                            Progress::METHOD,
+                            ProgressParams {
+                                token: ProgressToken::Number(session.sync_odoo.progress_token),
+                                value: ProgressParamsValue::WorkDone(WorkDoneProgress::End(
+                                    WorkDoneProgressEnd { message: None },
+                                )),
+                            },
+                        );
+                    }
+                    return true;
+                }
+                ProcessState::NeedsMoreWork => {
+>>>>>>> d72d1a6 (feat: implement batch processing for improved responsiveness (FASE 1))
                     continue;
                 }
+<<<<<<< HEAD
                 already_arch_rebuilt.insert(tree);
                 let mut builder = PythonArchBuilder::new(entry.unwrap(), sym_rc);
                 builder.load_arch(session);
@@ -1258,8 +1396,76 @@ impl SyncOdoo {
                     }
                 }
                 continue;
+||||||| parent of d72d1a6 (feat: implement batch processing for improved responsiveness (FASE 1))
+                already_arch_rebuilt.insert(tree);
+                let mut builder = PythonArchBuilder::new(entry.unwrap(), sym_rc);
+                builder.load_arch(session);
+                continue;
+            }
+            let sym = session.sync_odoo.pop_item(BuildSteps::ARCH_EVAL);
+            if let Some(sym_rc) = sym {
+                let (tree, entry) = sym_rc.borrow().get_tree_and_entry();
+                if already_arch_eval_rebuilt.contains(&tree) {
+                    info!("Already arch eval rebuilt, skipping");
+                    continue;
+                }
+                already_arch_eval_rebuilt.insert(tree);
+                let mut builder = PythonArchEval::new(entry.unwrap(), sym_rc);
+                builder.eval_arch(session);
+                continue;
+            }
+            let sym = session.sync_odoo.pop_item(BuildSteps::VALIDATION);
+            if let Some(sym_rc) = sym {
+                let (tree, entry) = sym_rc.borrow_mut().get_tree_and_entry();
+                if already_validation_rebuilt.contains(&tree) {
+                    info!("Already validation rebuilt, skipping");
+                    continue;
+                }
+                already_validation_rebuilt.insert(tree);
+                if session.sync_odoo.state_init == InitState::ODOO_READY {
+                    let mut no_validation = no_validation;
+                    if session.sync_odoo.interrupt_rebuild.load(Ordering::SeqCst) {
+                        session
+                            .sync_odoo
+                            .interrupt_rebuild
+                            .store(false, Ordering::SeqCst);
+                        session.log_message(MessageType::INFO, S!("Rebuild interrupted"));
+                        no_validation = true;
+                    }
+                    if no_validation {
+                        session.request_delayed_rebuild();
+                        session.sync_odoo.add_to_validations(sym_rc.clone());
+                        if is_reporting_progress {
+                            session.send_notification(
+                                Progress::METHOD,
+                                ProgressParams {
+                                    token: ProgressToken::Number(session.sync_odoo.progress_token),
+                                    value: ProgressParamsValue::WorkDone(WorkDoneProgress::End(
+                                        WorkDoneProgressEnd { message: None },
+                                    )),
+                                },
+                            );
+                        }
+                        return true;
+                    }
+                }
+                let typ = sym_rc.borrow().typ();
+                match typ {
+                    SymType::XML_FILE => {
+                        let mut validator = XmlValidator::new(entry.as_ref().unwrap(), sym_rc);
+                        validator.validate(session);
+                    }
+                    _ => {
+                        let mut validator = PythonValidator::new(entry.unwrap(), sym_rc);
+                        validator.validate(session);
+                    }
+                }
+                continue;
+=======
+>>>>>>> d72d1a6 (feat: implement batch processing for improved responsiveness (FASE 1))
             }
         }
+
         if session.sync_odoo.need_rebuild {
             session.log_message(
                 MessageType::INFO,
@@ -1287,6 +1493,11 @@ impl SyncOdoo {
             session.sync_odoo.rebuild_arch_eval.len(),
             session.sync_odoo.rebuild_validation.len()
         );
+
+        session.sync_odoo.already_arch_rebuilt.clear();
+        session.sync_odoo.already_arch_eval_rebuilt.clear();
+        session.sync_odoo.already_validation_rebuilt.clear();
+
         true
     }
 

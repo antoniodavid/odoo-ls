@@ -287,16 +287,35 @@ pub fn delayed_changes_process_thread(sender_session: Sender<Message>, receiver_
         }
         if got_process{
             got_process = false;
-            let mut session = SessionInfo{
-                sender: sender_session.clone(),
-                receiver: receiver_session.clone(),
-                sync_odoo: &mut sync_odoo.lock().unwrap(),
-                delayed_process_sender: Some(delayed_process_sender.clone()),
-                noqas_stack: vec![],
-                current_noqa: NoqaInfo::None,
-            };
-            info!("Processing delayed file changes...");
-            SyncOdoo::process_rebuilds(&mut session, false);
+            info!("Processing delayed file changes in batches...");
+            
+            loop {
+                let state = {
+                    let mut session = SessionInfo{
+                        sender: sender_session.clone(),
+                        receiver: receiver_session.clone(),
+                        sync_odoo: &mut sync_odoo.lock().unwrap(),
+                        delayed_process_sender: Some(delayed_process_sender.clone()),
+                        noqas_stack: vec![],
+                        current_noqa: NoqaInfo::None,
+                    };
+                    SyncOdoo::process_rebuilds_batch(&mut session, 100, false)
+                };
+                
+                match state {
+                    crate::core::odoo::ProcessState::Complete => {
+                        info!("Batch processing complete");
+                        break;
+                    },
+                    crate::core::odoo::ProcessState::Interrupted => {
+                        info!("Batch processing interrupted");
+                        break;
+                    },
+                    crate::core::odoo::ProcessState::NeedsMoreWork => {
+                        std::thread::sleep(std::time::Duration::from_millis(5));
+                    }
+                }
+            }
         }
     }
 }
