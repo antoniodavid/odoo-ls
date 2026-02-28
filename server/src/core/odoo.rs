@@ -10,6 +10,9 @@ use crate::features::completion::CompletionFeature;
 use crate::features::definition::DefinitionFeature;
 use crate::features::document_symbols::DocumentSymbolFeature;
 use crate::features::hover::HoverFeature;
+use crate::features::js_completion::JsCompletionFeature;
+use crate::features::js_definition::JsDefinitionFeature;
+use crate::features::js_hover::JsHoverFeature;
 use crate::features::references::ReferenceFeature;
 use crate::features::workspace_symbols::WorkspaceSymbolFeature;
 use crate::fifo_ptr_weak_hash_set::FifoPtrWeakHashSet;
@@ -36,6 +39,7 @@ use super::import_resolver::ImportCache;
 use super::symbols::module_symbol::ModuleSymbol;
 use super::symbols::package_symbol::PackageSymbol;
 use super::symbols::symbol::Symbol;
+use crate::core::js_index::JsModuleIndex;
 use crate::core::model::Model;
 use crate::core::python_arch_builder::PythonArchBuilder;
 use crate::core::python_arch_eval::PythonArchEval;
@@ -112,6 +116,8 @@ pub struct SyncOdoo {
     pub file_metadata_cache: Option<CacheData>,
     pub module_cache_manager: Option<crate::core::cache::ModuleCacheManager>,
 
+    pub js_index: JsModuleIndex,
+
     pub test_mode: bool,
     already_arch_rebuilt: HashSet<Tree>,
     already_arch_eval_rebuilt: HashSet<Tree>,
@@ -161,6 +167,7 @@ impl SyncOdoo {
             opened_files: vec![],
             file_metadata_cache: None,
             module_cache_manager: crate::core::cache::ModuleCacheManager::new(),
+            js_index: JsModuleIndex::new(),
 
             test_mode: false,
             already_arch_rebuilt: HashSet::new(),
@@ -870,6 +877,14 @@ impl SyncOdoo {
 
                                     if let Some(module_rc) = module_rc_opt {
                                         modules.push(module_rc);
+
+                                        // Phase 2: Build JS Module Index for this addon
+                                        let addon_name =
+                                            item.file_name().to_string_lossy().to_string();
+                                        session
+                                            .sync_odoo
+                                            .js_index
+                                            .scan_addon(&addon_name, &item.path());
                                     }
                                 }
                             }
@@ -2313,7 +2328,11 @@ impl Odoo {
                     .text_document
                     .uri
                     .to_string();
-                if !uri.ends_with(".py") && !uri.ends_with(".xml") && !uri.ends_with(".csv") {
+                if !uri.ends_with(".py")
+                    && !uri.ends_with(".xml")
+                    && !uri.ends_with(".csv")
+                    && !uri.ends_with(".js")
+                {
                     return Ok(None);
                 }
                 match params
@@ -2347,29 +2366,56 @@ impl Odoo {
             _ => return Ok(None),
         };
         let file_path_buf = PathBuf::from(path.clone());
+        let is_js = file_path_buf.extension().map_or(false, |ext| ext == "js");
+
         if let Some(file_symbol) = SyncOdoo::get_symbol_of_opened_file(session, &file_path_buf) {
             if SyncOdoo::is_non_main_manifest_file(&file_symbol, &file_path_buf) {
                 //If the file is not in main entry, and is a manifest file, we skip it
                 return Ok(None);
             }
-            let file_info = session
-                .sync_odoo
-                .get_file_mgr()
-                .borrow_mut()
-                .get_file_info(&path);
-            if let Some(file_info) = file_info {
-                if file_info
+        } else if !is_js {
+            return Ok(None);
+        }
+
+        let mut file_info = session
+            .sync_odoo
+            .get_file_mgr()
+            .borrow_mut()
+            .get_file_info(&path);
+
+        // If it's a JS file and not tracked, force an update so we can parse it
+        if file_info.is_none() && is_js {
+            if let Ok(_content) = std::fs::read_to_string(&path) {
+                let _ = session
+                    .sync_odoo
+                    .get_file_mgr()
+                    .borrow_mut()
+                    .update_file_info(session, &path, None, None, false);
+                file_info = session
+                    .sync_odoo
+                    .get_file_mgr()
                     .borrow()
-                    .file_info_ast
-                    .borrow()
-                    .indexed_module
-                    .is_none()
-                {
-                    file_info.borrow_mut().prepare_ast(session);
-                }
-                let ast_type = file_info.borrow().file_info_ast.borrow().ast_type.clone();
-                match ast_type {
-                    AstType::Python => {
+                    .get_file_info(&path);
+            }
+        }
+
+        if let Some(file_info) = file_info {
+            if file_info
+                .borrow()
+                .file_info_ast
+                .borrow()
+                .indexed_module
+                .is_none()
+                && !is_js
+            {
+                file_info.borrow_mut().prepare_ast(session);
+            }
+            let ast_type = file_info.borrow().file_info_ast.borrow().ast_type.clone();
+            match ast_type {
+                AstType::Python => {
+                    if let Some(file_symbol) =
+                        SyncOdoo::get_symbol_of_opened_file(session, &file_path_buf)
+                    {
                         if file_info
                             .borrow_mut()
                             .file_info_ast
@@ -2386,7 +2432,11 @@ impl Odoo {
                             ));
                         }
                     }
-                    AstType::Xml => {
+                }
+                AstType::Xml => {
+                    if let Some(file_symbol) =
+                        SyncOdoo::get_symbol_of_opened_file(session, &file_path_buf)
+                    {
                         return Ok(HoverFeature::hover_xml(
                             session,
                             &file_symbol,
@@ -2395,7 +2445,11 @@ impl Odoo {
                             params.text_document_position_params.position.character,
                         ));
                     }
-                    AstType::Csv => {
+                }
+                AstType::Csv => {
+                    if let Some(file_symbol) =
+                        SyncOdoo::get_symbol_of_opened_file(session, &file_path_buf)
+                    {
                         return Ok(HoverFeature::hover_csv(
                             session,
                             &file_symbol,
@@ -2404,6 +2458,22 @@ impl Odoo {
                             params.text_document_position_params.position.character,
                         ));
                     }
+                }
+                AstType::Js => {
+                    let fia = file_info.borrow().file_info_ast.clone();
+                    let fia_ref = fia.borrow();
+                    if let Some(text_doc) = fia_ref.text_document.as_ref() {
+                        let content = text_doc.contents();
+                        return Ok(JsHoverFeature::get_hover(
+                            &content,
+                            params.text_document_position_params.position.line,
+                            params.text_document_position_params.position.character,
+                            &file_path_buf,
+                            &session.sync_odoo.js_index,
+                            fia_ref.js_module_info.as_ref().map(|rc| rc.as_ref()),
+                        ));
+                    }
+                    return Ok(None);
                 }
             }
         }
@@ -2443,7 +2513,11 @@ impl Odoo {
                     .text_document
                     .uri
                     .to_string();
-                if !uri.ends_with(".py") && !uri.ends_with(".xml") && !uri.ends_with(".csv") {
+                if !uri.ends_with(".py")
+                    && !uri.ends_with(".xml")
+                    && !uri.ends_with(".csv")
+                    && !uri.ends_with(".js")
+                {
                     return Ok(None);
                 }
                 match params
@@ -2477,29 +2551,39 @@ impl Odoo {
             _ => return Ok(None),
         };
         let file_path_buf = PathBuf::from(path.clone());
+        let is_js = file_path_buf.extension().map_or(false, |ext| ext == "js");
+
         if let Some(file_symbol) = SyncOdoo::get_symbol_of_opened_file(session, &file_path_buf) {
             if SyncOdoo::is_non_main_manifest_file(&file_symbol, &file_path_buf) {
                 //If the file is not in main entry, and is a manifest file, we skip it
                 return Ok(None);
             }
-            let file_info = session
-                .sync_odoo
-                .get_file_mgr()
+        } else if !is_js {
+            return Ok(None);
+        }
+
+        let file_info = session
+            .sync_odoo
+            .get_file_mgr()
+            .borrow()
+            .get_file_info(&path);
+        if let Some(file_info) = file_info {
+            if file_info
                 .borrow()
-                .get_file_info(&path);
-            if let Some(file_info) = file_info {
-                if file_info
-                    .borrow()
-                    .file_info_ast
-                    .borrow()
-                    .indexed_module
-                    .is_none()
-                {
-                    file_info.borrow_mut().prepare_ast(session);
-                }
-                let ast_type = file_info.borrow().file_info_ast.borrow().ast_type.clone();
-                match ast_type {
-                    AstType::Python => {
+                .file_info_ast
+                .borrow()
+                .indexed_module
+                .is_none()
+                && !is_js
+            {
+                file_info.borrow_mut().prepare_ast(session);
+            }
+            let ast_type = file_info.borrow().file_info_ast.borrow().ast_type.clone();
+            match ast_type {
+                AstType::Python => {
+                    if let Some(file_symbol) =
+                        SyncOdoo::get_symbol_of_opened_file(session, &file_path_buf)
+                    {
                         if file_info
                             .borrow()
                             .file_info_ast
@@ -2516,7 +2600,11 @@ impl Odoo {
                             ));
                         }
                     }
-                    AstType::Xml => {
+                }
+                AstType::Xml => {
+                    if let Some(file_symbol) =
+                        SyncOdoo::get_symbol_of_opened_file(session, &file_path_buf)
+                    {
                         return Ok(DefinitionFeature::get_location_xml(
                             session,
                             &file_symbol,
@@ -2525,7 +2613,11 @@ impl Odoo {
                             params.text_document_position_params.position.character,
                         ));
                     }
-                    AstType::Csv => {
+                }
+                AstType::Csv => {
+                    if let Some(file_symbol) =
+                        SyncOdoo::get_symbol_of_opened_file(session, &file_path_buf)
+                    {
                         return Ok(DefinitionFeature::get_location_csv(
                             session,
                             &file_symbol,
@@ -2534,6 +2626,39 @@ impl Odoo {
                             params.text_document_position_params.position.character,
                         ));
                     }
+                }
+                AstType::Js => {
+                    let _ = std::fs::write(
+                        "/tmp/odoo_ls_gtd.log",
+                        format!(
+                            "JS GtD req at line: {}",
+                            params.text_document_position_params.position.line
+                        ),
+                    );
+
+                    let fia = file_info.borrow().file_info_ast.clone();
+                    let fia_ref = fia.borrow();
+                    if let Some(text_doc) = fia_ref.text_document.as_ref() {
+                        let content = text_doc.contents();
+                        let res = JsDefinitionFeature::get_location(
+                            &content,
+                            params.text_document_position_params.position.line,
+                            params.text_document_position_params.position.character,
+                            &file_path_buf,
+                            &session.sync_odoo.js_index,
+                            fia_ref.js_module_info.as_ref().map(|rc| rc.as_ref()),
+                        );
+
+                        if res.is_some() {
+                            let _ = std::fs::write("/tmp/odoo_ls_gtd_res.log", "FOUND DEFINITION");
+                        } else {
+                            let _ =
+                                std::fs::write("/tmp/odoo_ls_gtd_res.log", "NO DEFINITION FOUND");
+                        }
+
+                        return Ok(res);
+                    }
+                    return Ok(None);
                 }
             }
         }
@@ -2559,10 +2684,12 @@ impl Odoo {
         let uri = params.text_document_position.text_document.uri.to_string();
         let path = FileMgr::uri2pathname(uri.as_str());
         let file_path_buf = PathBuf::from(path.clone());
+        let is_js = file_path_buf.extension().map_or(false, |ext| ext == "js");
         if uri.ends_with(".py")
             || uri.ends_with(".pyi")
             || uri.ends_with(".xml")
             || uri.ends_with(".csv")
+            || is_js
         {
             if let Some(file_symbol) = SyncOdoo::get_symbol_of_opened_file(session, &file_path_buf)
             {
@@ -2570,24 +2697,48 @@ impl Odoo {
                     //If the file is not in main entry, and is a manifest file, we skip it
                     return Ok(None);
                 }
-                let file_info = session
-                    .sync_odoo
-                    .get_file_mgr()
-                    .borrow_mut()
-                    .get_file_info(&path);
-                if let Some(file_info) = file_info {
-                    if file_info
+            } else if !is_js {
+                return Ok(None);
+            }
+
+            let mut file_info = session
+                .sync_odoo
+                .get_file_mgr()
+                .borrow_mut()
+                .get_file_info(&path);
+
+            // If it's a JS file and not tracked, force an update so we can parse it
+            if file_info.is_none() && is_js {
+                if let Ok(_content) = std::fs::read_to_string(&path) {
+                    let _ = session
+                        .sync_odoo
+                        .get_file_mgr()
+                        .borrow_mut()
+                        .update_file_info(session, &path, None, None, false);
+                    file_info = session
+                        .sync_odoo
+                        .get_file_mgr()
                         .borrow()
-                        .file_info_ast
-                        .borrow()
-                        .indexed_module
-                        .is_none()
-                    {
-                        file_info.borrow_mut().prepare_ast(session);
-                    }
-                    let ast_type = file_info.borrow().file_info_ast.borrow().ast_type.clone();
-                    match ast_type {
-                        AstType::Python => {
+                        .get_file_info(&path);
+                }
+            }
+
+            if let Some(file_info) = file_info {
+                if file_info
+                    .borrow()
+                    .file_info_ast
+                    .borrow()
+                    .indexed_module
+                    .is_none()
+                {
+                    file_info.borrow_mut().prepare_ast(session);
+                }
+                let ast_type = file_info.borrow().file_info_ast.borrow().ast_type.clone();
+                match ast_type {
+                    AstType::Python => {
+                        if let Some(file_symbol) =
+                            SyncOdoo::get_symbol_of_opened_file(session, &file_path_buf)
+                        {
                             if file_info
                                 .borrow_mut()
                                 .file_info_ast
@@ -2604,7 +2755,11 @@ impl Odoo {
                                 ));
                             }
                         }
-                        AstType::Xml => {
+                    }
+                    AstType::Xml => {
+                        if let Some(file_symbol) =
+                            SyncOdoo::get_symbol_of_opened_file(session, &file_path_buf)
+                        {
                             return Ok(ReferenceFeature::get_references_xml(
                                 session,
                                 &file_symbol,
@@ -2613,7 +2768,11 @@ impl Odoo {
                                 params.text_document_position.position.character,
                             ));
                         }
-                        AstType::Csv => {
+                    }
+                    AstType::Csv => {
+                        if let Some(file_symbol) =
+                            SyncOdoo::get_symbol_of_opened_file(session, &file_path_buf)
+                        {
                             return Ok(ReferenceFeature::get_references_csv(
                                 session,
                                 &file_symbol,
@@ -2622,6 +2781,10 @@ impl Odoo {
                                 params.text_document_position.position.character,
                             ));
                         }
+                    }
+                    AstType::Js => {
+                        // JS references not yet implemented
+                        return Ok(None);
                     }
                 }
             }
@@ -2633,6 +2796,21 @@ impl Odoo {
         session: &mut SessionInfo,
         params: CompletionParams,
     ) -> Result<Option<CompletionResponse>, ResponseError> {
+        let log_msg = format!(
+            ">>> AUTOCOMPLETE ENTERED: {:?}",
+            params.text_document_position.text_document.uri.as_str()
+        );
+        let _ = std::fs::write("/tmp/odoo_ls_autocomplete.log", log_msg);
+
+        // SUPER DEBUG LOG TO SEE IF ANY COMPLETION REQUEST ARRIVES
+        let _ = std::fs::write(
+            "/tmp/odoo_ls_autocomplete_entry.log",
+            format!(
+                "Autocomplete requested! URI: {}",
+                params.text_document_position.text_document.uri.to_string()
+            ),
+        );
+
         if session.sync_odoo.state_init == InitState::NOT_READY {
             return Ok(None);
         }
@@ -2654,7 +2832,11 @@ impl Odoo {
         {
             Some(schema) if schema == "file" => {
                 let uri = params.text_document_position.text_document.uri.to_string();
-                if !uri.ends_with(".py") && !uri.ends_with(".xml") && !uri.ends_with(".csv") {
+                if !uri.ends_with(".py")
+                    && !uri.ends_with(".xml")
+                    && !uri.ends_with(".csv")
+                    && !uri.ends_with(".js")
+                {
                     return Ok(None);
                 }
                 match params
@@ -2683,41 +2865,145 @@ impl Odoo {
             _ => return Ok(None),
         };
         let path_buf = PathBuf::from(path.clone());
+        let is_js = path_buf.extension().map_or(false, |ext| ext == "js");
+
+        let _ = std::fs::write(
+            "/tmp/odoo_ls_autocomplete_path.log",
+            format!("Path: {}, is_js: {}", path, is_js),
+        );
+
         if let Some(file_symbol) = SyncOdoo::get_symbol_of_opened_file(session, &path_buf) {
             if SyncOdoo::is_non_main_manifest_file(&file_symbol, &path_buf) {
-                //If the file is not in main entry, and is a manifest file, we skip it
+                let _ = std::fs::write(
+                    "/tmp/odoo_ls_autocomplete_abort.log",
+                    "Skipped due to non main manifest",
+                );
                 return Ok(None);
             }
-            let file_info = session
-                .sync_odoo
-                .get_file_mgr()
-                .borrow_mut()
-                .get_file_info(&path);
-            if let Some(file_info) = file_info {
-                if schema != "untitled"
-                    && file_info
-                        .borrow()
-                        .file_info_ast
-                        .borrow()
-                        .indexed_module
-                        .is_none()
-                {
-                    file_info.borrow_mut().prepare_ast(session);
-                }
-                if file_info
+        } else if !is_js {
+            let _ = std::fs::write(
+                "/tmp/odoo_ls_autocomplete_abort.log",
+                "Skipped due to not JS and no file symbol",
+            );
+            return Ok(None);
+        }
+
+        let mut file_info = session
+            .sync_odoo
+            .get_file_mgr()
+            .borrow_mut()
+            .get_file_info(&path);
+
+        let _ = std::fs::write(
+            "/tmp/odoo_ls_autocomplete_fileinfo.log",
+            format!("FileInfo exists: {}", file_info.is_some()),
+        );
+
+        // If it's a JS file and not tracked, force an update so we can parse it
+        if file_info.is_none() && is_js {
+            if let Ok(content) = std::fs::read_to_string(&path) {
+                let _ = session
+                    .sync_odoo
+                    .get_file_mgr()
                     .borrow_mut()
+                    .update_file_info(
+                        session,
+                        &path,
+                        Some(&vec![lsp_types::TextDocumentContentChangeEvent {
+                            range: None,
+                            range_length: None,
+                            text: content,
+                        }]),
+                        None,
+                        false,
+                    );
+                file_info = session
+                    .sync_odoo
+                    .get_file_mgr()
+                    .borrow()
+                    .get_file_info(&path);
+            }
+        }
+
+        let _ = std::fs::write(
+            "/tmp/odoo_ls_autocomplete_fileinfo2.log",
+            format!("FileInfo after check: {}", file_info.is_some()),
+        );
+
+        if let Some(file_info) = file_info {
+            if schema != "untitled"
+                && file_info
+                    .borrow()
                     .file_info_ast
                     .borrow()
                     .indexed_module
-                    .is_some()
-                {
-                    return Ok(CompletionFeature::autocomplete(
-                        session,
-                        &file_symbol,
-                        &file_info,
-                        params.text_document_position.position.line,
-                        params.text_document_position.position.character,
-                    ));
+                    .is_none()
+                && !is_js
+            // JS files use js_module_info, not indexed_module
+            {
+                file_info.borrow_mut().prepare_ast(session);
+            }
+
+            let ast_type = file_info.borrow().file_info_ast.borrow().ast_type.clone();
+            match ast_type {
+                AstType::Js => {
+                    // DEBUG LOG
+                    let _ = std::fs::write(
+                        "/tmp/odoo_ls_debug.log",
+                        format!(
+                            "JS Completion requested at line: {}",
+                            params.text_document_position.position.line
+                        ),
+                    );
+
+                    let fia = file_info.borrow().file_info_ast.clone();
+                    let fia_ref = fia.borrow();
+                    if let Some(text_doc) = fia_ref.text_document.as_ref() {
+                        let content = text_doc.contents();
+
+                        let res = JsCompletionFeature::autocomplete(
+                            &content,
+                            params.text_document_position.position.line,
+                            params.text_document_position.position.character,
+                            &session.sync_odoo.js_index,
+                            fia_ref.js_module_info.as_ref().map(|rc| rc.as_ref()),
+                        );
+
+                        let count = res
+                            .as_ref()
+                            .map(|r| match r {
+                                CompletionResponse::Array(a) => a.len(),
+                                CompletionResponse::List(l) => l.items.len(),
+                            })
+                            .unwrap_or(0);
+                        let _ = std::fs::write(
+                            "/tmp/odoo_ls_debug_res.log",
+                            format!("Returned {} items", count),
+                        );
+
+                        return Ok(res);
+                    }
+                }
+                _ => {
+                    if let Some(file_symbol) =
+                        SyncOdoo::get_symbol_of_opened_file(session, &path_buf)
+                    {
+                        if file_info
+                            .borrow_mut()
+                            .file_info_ast
+                            .borrow()
+                            .indexed_module
+                            .is_some()
+                        {
+                            return Ok(CompletionFeature::autocomplete(
+                                session,
+                                &file_symbol,
+                                &file_info,
+                                params.text_document_position.position.line,
+                                params.text_document_position.position.character,
+                            ));
+                        }
+                    }
                 }
             }
         }
@@ -3242,6 +3528,29 @@ impl Odoo {
         );
         if session.sync_odoo.state_init != InitState::NOT_READY && valid && updated {
             Odoo::update_file_index(session, path_buf.clone(), file_extension, false, false);
+
+            // Also update the JS module index immediately if it's a JS file
+            if file_extension == "js" {
+                if let Some(file_info) = session
+                    .sync_odoo
+                    .get_file_mgr()
+                    .borrow()
+                    .get_file_info(&path)
+                {
+                    let fia = file_info.borrow().file_info_ast.clone();
+                    let fia_ref = fia.borrow();
+                    if let Some(js_info) = fia_ref.js_module_info.as_ref() {
+                        // Extract addon name using the same logic as the indexer
+                        let path_str = path_buf.to_string_lossy().to_string();
+                        if path_str.contains("/static/src/") {
+                            session
+                                .sync_odoo
+                                .js_index
+                                .update_module(path_buf.clone(), js_info.as_ref().clone());
+                        }
+                    }
+                }
+            }
         }
     }
 
@@ -3273,7 +3582,7 @@ impl Odoo {
         content: Option<&Vec<TextDocumentContentChangeEvent>>,
         version: i32,
     ) -> (bool, bool) {
-        if ["py", "xml", "csv"].contains(&extension)
+        if ["py", "xml", "csv", "js"].contains(&extension)
             || Odoo::is_config_workspace_file(session, &PathBuf::from(path))
         {
             session.log_message(
@@ -3298,7 +3607,7 @@ impl Odoo {
         _is_open: bool,
         force_delay: bool,
     ) {
-        if ["py", "xml", "csv"].contains(&extension)
+        if ["py", "xml", "csv", "js"].contains(&extension)
             || Odoo::is_config_workspace_file(session, &path)
         {
             SessionInfo::request_update_file_index(session, &path, force_delay);
@@ -3328,6 +3637,7 @@ impl Odoo {
                     && !uri.ends_with(".pyi")
                     && !uri.ends_with(".xml")
                     && !uri.ends_with(".csv")
+                    && !uri.ends_with(".js")
                 {
                     return Ok(None);
                 }

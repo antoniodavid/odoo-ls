@@ -1,33 +1,32 @@
 use lsp_types::{Diagnostic, DiagnosticTag, Position, Range};
 use ruff_python_ast::{Expr, Stmt};
 use ruff_text_size::{Ranged, TextRange};
-use tracing::{error, info};
-use weak_table::{PtrWeakHashSet, PtrWeakKeyHashMap};
 use std::collections::{HashMap, HashSet};
 use std::ffi::OsStr;
+use tracing::{error, info, warn};
+use weak_table::{PtrWeakHashSet, PtrWeakKeyHashMap};
 
+use crate::core::cache::{CachedField, CachedModel, CachedModule};
 use crate::core::csv_arch_builder::CsvArchBuilder;
 use crate::core::diagnostics::{create_diagnostic, DiagnosticCode};
-use crate::core::xml_arch_builder::XmlArchBuilder;
-use crate::core::xml_data::OdooData;
-use crate::{constants::*, oyarn, Sy};
 use crate::core::file_mgr::{FileInfo, FileMgr, NoqaInfo};
 use crate::core::import_resolver::find_module;
 use crate::core::model::Model;
 use crate::core::odoo::SyncOdoo;
-use crate::core::cache::{CachedModule, CachedModel, CachedField};
 use crate::core::symbols::symbol::Symbol;
 use crate::core::symbols::symbol_mgr::SymbolMgr;
+use crate::core::xml_arch_builder::XmlArchBuilder;
+use crate::core::xml_data::OdooData;
 use crate::threads::SessionInfo;
 use crate::utils::PathSanitizer as _;
 use crate::S;
+use crate::{constants::*, oyarn, Sy};
+use std::cell::RefCell;
 use std::path::PathBuf;
 use std::rc::{Rc, Weak};
-use std::cell::RefCell;
 
 use super::symbol_mgr::SectionRange;
 use super::xml_file_symbol::XmlFileSymbol;
-
 
 #[derive(Debug)]
 pub struct ModuleSymbol {
@@ -65,13 +64,20 @@ pub struct ModuleSymbol {
     pub symbols: HashMap<OYarn, HashMap<u32, Vec<Rc<RefCell<Symbol>>>>>,
     //--- dynamics variables
     pub ext_symbols: HashMap<OYarn, PtrWeakHashSet<Weak<RefCell<Symbol>>>>,
-    pub decl_ext_symbols: PtrWeakKeyHashMap<Weak<RefCell<Symbol>>, HashMap<OYarn, HashMap<u32, Vec<Rc<RefCell<Symbol>>>>>>,
+    pub decl_ext_symbols: PtrWeakKeyHashMap<
+        Weak<RefCell<Symbol>>,
+        HashMap<OYarn, HashMap<u32, Vec<Rc<RefCell<Symbol>>>>>,
+    >,
     pub data_symbols: HashMap<String, Rc<RefCell<Symbol>>>,
 }
 
 impl ModuleSymbol {
-
-    pub fn new(session: &mut SessionInfo, name: String, dir_path: &PathBuf, is_external: bool) -> Option<Self> {
+    pub fn new(
+        session: &mut SessionInfo,
+        name: String,
+        dir_path: &PathBuf,
+        is_external: bool,
+    ) -> Option<Self> {
         let mut module = ModuleSymbol {
             name: oyarn!("{}", name),
             path: dir_path.sanitize(),
@@ -87,7 +93,7 @@ impl ModuleSymbol {
             xml_id_locations: HashMap::new(),
             xml_ids: HashMap::new(),
             dir_name: OYarn::from(""),
-            depends: vec!((OYarn::from("base"), TextRange::default())),
+            depends: vec![(OYarn::from("base"), TextRange::default())],
             all_depends: HashSet::new(),
             data: Vec::new(),
             weak_self: None,
@@ -109,20 +115,58 @@ impl ModuleSymbol {
         };
         module._init_symbol_mgr();
         info!("building new module: {:?}", dir_path.sanitize());
-        if dir_path.components().last().unwrap().as_os_str().to_str().unwrap() == "base" {
+        if dir_path
+            .components()
+            .last()
+            .unwrap()
+            .as_os_str()
+            .to_str()
+            .unwrap()
+            == "base"
+        {
             module.depends.clear();
         }
-        module.dir_name = oyarn!("{}", dir_path.with_extension("").components().last().unwrap().as_os_str().to_str().unwrap());
+        module.dir_name = oyarn!(
+            "{}",
+            dir_path
+                .with_extension("")
+                .components()
+                .last()
+                .unwrap()
+                .as_os_str()
+                .to_str()
+                .unwrap()
+        );
         let manifest_path = dir_path.join("__manifest__.py");
         if !manifest_path.exists() {
-            return None
+            return None;
         }
-        let (_, manifest_file_info) = session.sync_odoo.get_file_mgr().borrow_mut().update_file_info(session, manifest_path.sanitize().as_str(), None, None, false);
+        let (_, manifest_file_info) = session
+            .sync_odoo
+            .get_file_mgr()
+            .borrow_mut()
+            .update_file_info(
+                session,
+                manifest_path.sanitize().as_str(),
+                None,
+                None,
+                false,
+            );
         let mut manifest_file_info = (*manifest_file_info).borrow_mut();
-        if manifest_file_info.file_info_ast.borrow().indexed_module.is_none() {
+        if manifest_file_info
+            .file_info_ast
+            .borrow()
+            .indexed_module
+            .is_none()
+        {
             manifest_file_info.prepare_ast(session);
         }
-        if manifest_file_info.file_info_ast.borrow().indexed_module.is_none() {
+        if manifest_file_info
+            .file_info_ast
+            .borrow()
+            .indexed_module
+            .is_none()
+        {
             return None;
         }
         let diags = module._load_manifest(session, &manifest_file_info);
@@ -137,13 +181,21 @@ impl ModuleSymbol {
     }
 
     pub fn add_symbol(&mut self, content: &Rc<RefCell<Symbol>>, section: u32) {
-        let sections = self.symbols.entry(content.borrow().name().clone()).or_insert_with(|| HashMap::new());
+        let sections = self
+            .symbols
+            .entry(content.borrow().name().clone())
+            .or_insert_with(|| HashMap::new());
         let section_vec = sections.entry(section).or_insert_with(|| vec![]);
         section_vec.push(content.clone());
     }
 
-    pub fn load_module_info(symbol: &Rc<RefCell<Symbol>>, session: &mut SessionInfo, odoo_addons: Rc<RefCell<Symbol>>) {
-        let (mut diagnostics, _loaded) = ModuleSymbol::_load_depends(symbol.clone(), session, odoo_addons);
+    pub fn load_module_info(
+        symbol: &Rc<RefCell<Symbol>>,
+        session: &mut SessionInfo,
+        odoo_addons: Rc<RefCell<Symbol>>,
+    ) {
+        let (mut diagnostics, _loaded) =
+            ModuleSymbol::_load_depends(symbol.clone(), session, odoo_addons);
         diagnostics.extend(ModuleSymbol::check_data(&symbol, session));
         if !symbol.borrow().as_module_package().loaded {
             diagnostics.append(&mut ModuleSymbol::_load_arch(symbol.clone(), session));
@@ -152,18 +204,35 @@ impl ModuleSymbol {
         let module = _symbol.as_module_package_mut();
         module.loaded = true;
         let manifest_path = PathBuf::from(module.root_path.clone()).join("__manifest__.py");
-        let manifest_file_info = session.sync_odoo.get_file_mgr().borrow().get_file_info(&manifest_path.sanitize()).expect("file not found in cache").clone();
+        let Some(manifest_file_info) = session
+            .sync_odoo
+            .get_file_mgr()
+            .borrow()
+            .get_file_info(&manifest_path.sanitize())
+        else {
+            warn!(
+                "Manifest file not found for module at {:?}, skipping diagnostics",
+                module.root_path
+            );
+            return;
+        };
         let mut manifest_file_info = (*manifest_file_info).borrow_mut();
         manifest_file_info.replace_diagnostics(crate::constants::BuildSteps::ARCH, diagnostics);
     }
 
     /* Load manifest to identify the module characteristics.
     Returns list of od diagnostics to publish in manifest file. */
-    fn _load_manifest(&mut self, session: &mut SessionInfo, file_info: &FileInfo) -> Vec<Diagnostic> {
+    fn _load_manifest(
+        &mut self,
+        session: &mut SessionInfo,
+        file_info: &FileInfo,
+    ) -> Vec<Diagnostic> {
         let mut res = vec![];
         let file_info_ast = file_info.file_info_ast.borrow();
         let ast = file_info_ast.get_stmts().unwrap();
-        if ast.len() != 1 || !matches!(ast.first(), Some(Stmt::Expr(expr)) if expr.value.is_dict_expr()) {
+        if ast.len() != 1
+            || !matches!(ast.first(), Some(Stmt::Expr(expr)) if expr.value.is_dict_expr())
+        {
             if let Some(diagnostic) = create_diagnostic(&session, DiagnosticCode::OLS04001, &[]) {
                 res.push(Diagnostic {
                     range: Range::new(Position::new(0, 0), Position::new(0, 1)),
@@ -173,7 +242,13 @@ impl ModuleSymbol {
             return res;
         }
         let mut visited_keys = HashSet::new();
-        let dict = &ast[0].as_expr_stmt().unwrap().value.clone().dict_expr().unwrap();
+        let dict = &ast[0]
+            .as_expr_stmt()
+            .unwrap()
+            .value
+            .clone()
+            .dict_expr()
+            .unwrap();
         for (index, key) in dict.iter_keys().enumerate() {
             match key {
                 Some(key) => {
@@ -181,84 +256,168 @@ impl ModuleSymbol {
                     match key {
                         Expr::StringLiteral(key_literal) => {
                             let key_str = key_literal.value.to_string();
-                            if visited_keys.contains(&key_str){
-                            if let Some(diagnostic) = create_diagnostic(&session, DiagnosticCode::OLS04002, &[]) {
-                                res.push(Diagnostic {
-                                    range: Range::new(Position::new(key_literal.range.start().to_u32(), 0), Position::new(key_literal.range.end().to_u32(), 0)),
-                                    ..diagnostic
-                                });
-                            }
+                            if visited_keys.contains(&key_str) {
+                                if let Some(diagnostic) =
+                                    create_diagnostic(&session, DiagnosticCode::OLS04002, &[])
+                                {
+                                    res.push(Diagnostic {
+                                        range: Range::new(
+                                            Position::new(key_literal.range.start().to_u32(), 0),
+                                            Position::new(key_literal.range.end().to_u32(), 0),
+                                        ),
+                                        ..diagnostic
+                                    });
+                                }
                             }
                             visited_keys.insert(key_str.clone());
                             if key_str == "name" {
                                 if !value.is_string_literal_expr() {
-                                    if let Some(diagnostic) = create_diagnostic(&session, DiagnosticCode::OLS04003, &[]) {
+                                    if let Some(diagnostic) =
+                                        create_diagnostic(&session, DiagnosticCode::OLS04003, &[])
+                                    {
                                         res.push(Diagnostic {
-                                            range: Range::new(Position::new(key_literal.range.start().to_u32(), 0), Position::new(key_literal.range.end().to_u32(), 0)),
+                                            range: Range::new(
+                                                Position::new(
+                                                    key_literal.range.start().to_u32(),
+                                                    0,
+                                                ),
+                                                Position::new(key_literal.range.end().to_u32(), 0),
+                                            ),
                                             ..diagnostic
                                         });
                                     }
                                 } else {
-                                    self.module_name = oyarn!("{}", value.as_string_literal_expr().unwrap().value);
+                                    self.module_name =
+                                        oyarn!("{}", value.as_string_literal_expr().unwrap().value);
                                 }
                             } else if key_str == "depends" {
                                 if !value.is_list_expr() {
-                                    if let Some(diagnostic) = create_diagnostic(&session, DiagnosticCode::OLS04004, &[]) {
+                                    if let Some(diagnostic) =
+                                        create_diagnostic(&session, DiagnosticCode::OLS04004, &[])
+                                    {
                                         res.push(Diagnostic {
-                                            range: Range::new(Position::new(key_literal.range.start().to_u32(), 0), Position::new(key_literal.range.end().to_u32(), 0)),
+                                            range: Range::new(
+                                                Position::new(
+                                                    key_literal.range.start().to_u32(),
+                                                    0,
+                                                ),
+                                                Position::new(key_literal.range.end().to_u32(), 0),
+                                            ),
                                             ..diagnostic
                                         });
                                     }
                                 } else {
                                     for depend in value.as_list_expr().unwrap().elts.iter() {
                                         if !depend.is_string_literal_expr() {
-                                            if let Some(diagnostic) = create_diagnostic(&session, DiagnosticCode::OLS04005, &[]) {
+                                            if let Some(diagnostic) = create_diagnostic(
+                                                &session,
+                                                DiagnosticCode::OLS04005,
+                                                &[],
+                                            ) {
                                                 res.push(Diagnostic {
-                                                    range: Range::new(Position::new(depend.range().start().to_u32(), 0), Position::new(depend.range().end().to_u32(), 0)),
+                                                    range: Range::new(
+                                                        Position::new(
+                                                            depend.range().start().to_u32(),
+                                                            0,
+                                                        ),
+                                                        Position::new(
+                                                            depend.range().end().to_u32(),
+                                                            0,
+                                                        ),
+                                                    ),
                                                     ..diagnostic
                                                 });
                                             }
                                         } else {
-                                            let depend_value = oyarn!("{}", depend.as_string_literal_expr().unwrap().value);
+                                            let depend_value = oyarn!(
+                                                "{}",
+                                                depend.as_string_literal_expr().unwrap().value
+                                            );
                                             if depend_value == self.dir_name {
-                                                if let Some(diagnostic) = create_diagnostic(&session, DiagnosticCode::OLS04006, &[]) {
+                                                if let Some(diagnostic) = create_diagnostic(
+                                                    &session,
+                                                    DiagnosticCode::OLS04006,
+                                                    &[],
+                                                ) {
                                                     res.push(Diagnostic {
-                                                        range: Range::new(Position::new(depend.range().start().to_u32(), 0), Position::new(depend.range().end().to_u32(), 0)),
+                                                        range: Range::new(
+                                                            Position::new(
+                                                                depend.range().start().to_u32(),
+                                                                0,
+                                                            ),
+                                                            Position::new(
+                                                                depend.range().end().to_u32(),
+                                                                0,
+                                                            ),
+                                                        ),
                                                         ..diagnostic
                                                     });
                                                 }
                                             } else {
-                                                self.depends.push((depend_value, depend.range().clone()));
+                                                self.depends
+                                                    .push((depend_value, depend.range().clone()));
                                             }
                                         }
                                     }
                                 }
                             } else if key_str == "data" {
                                 if !value.is_list_expr() {
-                                    if let Some(diagnostic) = create_diagnostic(&session, DiagnosticCode::OLS04007, &[]) {
+                                    if let Some(diagnostic) =
+                                        create_diagnostic(&session, DiagnosticCode::OLS04007, &[])
+                                    {
                                         res.push(Diagnostic {
-                                            range: Range::new(Position::new(key_literal.range.start().to_u32(), 0), Position::new(key_literal.range.end().to_u32(), 0)),
+                                            range: Range::new(
+                                                Position::new(
+                                                    key_literal.range.start().to_u32(),
+                                                    0,
+                                                ),
+                                                Position::new(key_literal.range.end().to_u32(), 0),
+                                            ),
                                             ..diagnostic
                                         });
                                     }
                                 } else {
                                     for data in value.as_list_expr().unwrap().elts.iter() {
                                         if !data.is_string_literal_expr() {
-                                            if let Some(diagnostic) = create_diagnostic(&session, DiagnosticCode::OLS04008, &[]) {
+                                            if let Some(diagnostic) = create_diagnostic(
+                                                &session,
+                                                DiagnosticCode::OLS04008,
+                                                &[],
+                                            ) {
                                                 res.push(Diagnostic {
-                                                    range: Range::new(Position::new(data.range().start().to_u32(), 0), Position::new(data.range().end().to_u32(), 0)),
+                                                    range: Range::new(
+                                                        Position::new(
+                                                            data.range().start().to_u32(),
+                                                            0,
+                                                        ),
+                                                        Position::new(
+                                                            data.range().end().to_u32(),
+                                                            0,
+                                                        ),
+                                                    ),
                                                     ..diagnostic
                                                 });
                                             }
                                         } else {
-                                            self.data.push((data.as_string_literal_expr().unwrap().value.to_string(), data.range().clone()));
+                                            self.data.push((
+                                                data.as_string_literal_expr()
+                                                    .unwrap()
+                                                    .value
+                                                    .to_string(),
+                                                data.range().clone(),
+                                            ));
                                         }
                                     }
                                 }
                             } else if key_str == "active" {
-                                if let Some(diagnostic) = create_diagnostic(&session, DiagnosticCode::OLS03302, &[]) {
+                                if let Some(diagnostic) =
+                                    create_diagnostic(&session, DiagnosticCode::OLS03302, &[])
+                                {
                                     res.push(Diagnostic {
-                                        range: Range::new(Position::new(key_literal.range().start().to_u32(), 0), Position::new(key_literal.range().end().to_u32(), 0)),
+                                        range: Range::new(
+                                            Position::new(key_literal.range().start().to_u32(), 0),
+                                            Position::new(key_literal.range().end().to_u32(), 0),
+                                        ),
                                         tags: Some(vec![DiagnosticTag::DEPRECATED]),
                                         ..diagnostic
                                     });
@@ -266,17 +425,24 @@ impl ModuleSymbol {
                             }
                         }
                         _ => {
-                            if let Some(diagnostic) = create_diagnostic(&session, DiagnosticCode::OLS04009, &[]) {
-                                    res.push(Diagnostic {
-                                        range: Range::new(Position::new(key.range().start().to_u32(), 0), Position::new(key.range().end().to_u32(), 0)),
-                                        ..diagnostic
-                                    });
+                            if let Some(diagnostic) =
+                                create_diagnostic(&session, DiagnosticCode::OLS04009, &[])
+                            {
+                                res.push(Diagnostic {
+                                    range: Range::new(
+                                        Position::new(key.range().start().to_u32(), 0),
+                                        Position::new(key.range().end().to_u32(), 0),
+                                    ),
+                                    ..diagnostic
+                                });
                             }
                         }
                     }
-                },
+                }
                 None => {
-                    if let Some(diagnostic_base) = create_diagnostic(&session, DiagnosticCode::OLS04011, &[]) {
+                    if let Some(diagnostic_base) =
+                        create_diagnostic(&session, DiagnosticCode::OLS04011, &[])
+                    {
                         res.push(Diagnostic {
                             range: Range::new(Position::new(0, 0), Position::new(0, 1)),
                             ..diagnostic_base.clone()
@@ -291,10 +457,28 @@ impl ModuleSymbol {
 
     /* ensure that all modules indicates in the module dependencies are well loaded.
     Returns list of diagnostics to publish in manifest file */
-    fn _load_depends(symbol_rc: Rc<RefCell<Symbol>>, session: &mut SessionInfo, odoo_addons: Rc<RefCell<Symbol>>) -> (Vec<Diagnostic>, Vec<OYarn>) {
-        symbol_rc.borrow_mut().as_module_package_mut().all_depends.clear();
-        let all_depends = symbol_rc.borrow_mut().as_module_package().depends.iter().map(|(depend, _)| depend.clone()).collect::<Vec<_>>();
-        symbol_rc.borrow_mut().as_module_package_mut().all_depends.extend(all_depends);
+    fn _load_depends(
+        symbol_rc: Rc<RefCell<Symbol>>,
+        session: &mut SessionInfo,
+        odoo_addons: Rc<RefCell<Symbol>>,
+    ) -> (Vec<Diagnostic>, Vec<OYarn>) {
+        symbol_rc
+            .borrow_mut()
+            .as_module_package_mut()
+            .all_depends
+            .clear();
+        let all_depends = symbol_rc
+            .borrow_mut()
+            .as_module_package()
+            .depends
+            .iter()
+            .map(|(depend, _)| depend.clone())
+            .collect::<Vec<_>>();
+        symbol_rc
+            .borrow_mut()
+            .as_module_package_mut()
+            .all_depends
+            .extend(all_depends);
         let mut diagnostics: Vec<Diagnostic> = vec![];
         let mut loaded: Vec<OYarn> = vec![];
         let dependencies = symbol_rc.borrow().as_module_package().depends.clone();
@@ -304,9 +488,28 @@ impl ModuleSymbol {
                 let mut symbol = symbol_rc.borrow_mut();
                 let module = find_module(session, odoo_addons.clone(), depend);
                 if module.is_none() {
-                    symbol.get_entry().unwrap().borrow_mut().not_found_symbols.insert(symbol.weak_self().as_ref().unwrap().upgrade().expect("The symbol must be in the tree"));
-                    symbol.not_found_paths_mut().push((BuildSteps::ARCH, vec![Sy!("odoo"), Sy!("addons"), depend.clone()]));
-                    if let Some(diagnostic_base) = create_diagnostic(&session, DiagnosticCode::OLS04010, &[&symbol.name(), &depend]) {
+                    symbol
+                        .get_entry()
+                        .unwrap()
+                        .borrow_mut()
+                        .not_found_symbols
+                        .insert(
+                            symbol
+                                .weak_self()
+                                .as_ref()
+                                .unwrap()
+                                .upgrade()
+                                .expect("The symbol must be in the tree"),
+                        );
+                    symbol.not_found_paths_mut().push((
+                        BuildSteps::ARCH,
+                        vec![Sy!("odoo"), Sy!("addons"), depend.clone()],
+                    ));
+                    if let Some(diagnostic_base) = create_diagnostic(
+                        &session,
+                        DiagnosticCode::OLS04010,
+                        &[&symbol.name(), &depend],
+                    ) {
                         diagnostics.push(Diagnostic {
                             range: FileMgr::textRange_to_temporary_Range(range),
                             ..diagnostic_base.clone()
@@ -316,15 +519,31 @@ impl ModuleSymbol {
                     loaded.push(depend.clone());
                     let module = module.unwrap();
                     let mut module = (*module).borrow_mut();
-                    symbol.as_module_package_mut().all_depends.extend(module.as_module_package().all_depends.clone());
+                    symbol
+                        .as_module_package_mut()
+                        .all_depends
+                        .extend(module.as_module_package().all_depends.clone());
                     symbol.add_dependency(&mut module, BuildSteps::ARCH, BuildSteps::ARCH);
                 }
             } else {
-                let module = session.sync_odoo.modules.get(depend).unwrap().upgrade().unwrap();
+                let module = session
+                    .sync_odoo
+                    .modules
+                    .get(depend)
+                    .unwrap()
+                    .upgrade()
+                    .unwrap();
                 SyncOdoo::build_now(session, &module, BuildSteps::ARCH);
                 let name = symbol_rc.borrow().name().clone();
-                if module.borrow().as_module_package().all_depends.contains(&name){
-                    if let Some(diagnostic_base) = create_diagnostic(&session, DiagnosticCode::OLS04012, &[depend]) {
+                if module
+                    .borrow()
+                    .as_module_package()
+                    .all_depends
+                    .contains(&name)
+                {
+                    if let Some(diagnostic_base) =
+                        create_diagnostic(&session, DiagnosticCode::OLS04012, &[depend])
+                    {
                         diagnostics.push(Diagnostic {
                             range: FileMgr::textRange_to_temporary_Range(range),
                             ..diagnostic_base.clone()
@@ -332,8 +551,16 @@ impl ModuleSymbol {
                     }
                 }
                 let mut module = (*module).borrow_mut();
-                symbol_rc.borrow_mut().as_module_package_mut().all_depends.extend(module.as_module_package().all_depends.clone());
-                symbol_rc.borrow_mut().add_dependency(&mut module, BuildSteps::ARCH, BuildSteps::ARCH)
+                symbol_rc
+                    .borrow_mut()
+                    .as_module_package_mut()
+                    .all_depends
+                    .extend(module.as_module_package().all_depends.clone());
+                symbol_rc.borrow_mut().add_dependency(
+                    &mut module,
+                    BuildSteps::ARCH,
+                    BuildSteps::ARCH,
+                )
             }
         }
         (diagnostics, loaded)
@@ -346,18 +573,40 @@ impl ModuleSymbol {
             //check if the file exists
             let path = PathBuf::from(symbol.borrow().paths()[0].clone()).join(data_url);
             if !path.exists() {
-                symbol.borrow_mut().as_module_package_mut().not_found_data.insert(path.sanitize(), BuildSteps::ARCH);
-                symbol.borrow().get_entry().unwrap().borrow_mut().not_found_symbols.insert(symbol.clone());
-                if let Some(diagnostic) = create_diagnostic(session, DiagnosticCode::OLS05049, &[&path.sanitize()]) {
+                symbol
+                    .borrow_mut()
+                    .as_module_package_mut()
+                    .not_found_data
+                    .insert(path.sanitize(), BuildSteps::ARCH);
+                symbol
+                    .borrow()
+                    .get_entry()
+                    .unwrap()
+                    .borrow_mut()
+                    .not_found_symbols
+                    .insert(symbol.clone());
+                if let Some(diagnostic) =
+                    create_diagnostic(session, DiagnosticCode::OLS05049, &[&path.sanitize()])
+                {
                     diagnostics.push(Diagnostic {
-                        range: Range::new(Position::new(data_range.start().to_u32(), 0), Position::new(data_range.end().to_u32(), 0)),
+                        range: Range::new(
+                            Position::new(data_range.start().to_u32(), 0),
+                            Position::new(data_range.end().to_u32(), 0),
+                        ),
                         ..diagnostic.clone()
                     });
                 }
-            } else if path.extension().map_or(true, |ext| !["xml", "csv", "sql"].contains(&ext.to_str().unwrap_or(""))) {
-                if let Some(diagnostic) = create_diagnostic(session, DiagnosticCode::OLS05050, &[&path.sanitize()]) {
+            } else if path.extension().map_or(true, |ext| {
+                !["xml", "csv", "sql"].contains(&ext.to_str().unwrap_or(""))
+            }) {
+                if let Some(diagnostic) =
+                    create_diagnostic(session, DiagnosticCode::OLS05050, &[&path.sanitize()])
+                {
                     diagnostics.push(Diagnostic {
-                        range: Range::new(Position::new(data_range.start().to_u32(), 0), Position::new(data_range.end().to_u32(), 0)),
+                        range: Range::new(
+                            Position::new(data_range.start().to_u32(), 0),
+                            Position::new(data_range.end().to_u32(), 0),
+                        ),
                         ..diagnostic.clone()
                     });
                 }
@@ -366,35 +615,66 @@ impl ModuleSymbol {
         diagnostics
     }
 
-    pub fn validate_manifest(symbol: &Rc<RefCell<Symbol>>, session: &mut SessionInfo){
+    pub fn validate_manifest(symbol: &Rc<RefCell<Symbol>>, session: &mut SessionInfo) {
         let data_paths = symbol.borrow().as_module_package().data.clone();
         let mut diagnostics = vec![];
         for (data_url, data_range) in data_paths.iter() {
             // validate csv file names, check that their models exist
             let path = PathBuf::from(symbol.borrow().paths()[0].clone()).join(data_url);
-            if path.extension().unwrap_or_default() != "csv" || !path.exists(){
+            if path.extension().unwrap_or_default() != "csv" || !path.exists() {
                 continue;
             }
-            let Some(model_name) = path.file_stem().and_then(OsStr::to_str).map(|n| Sy!(n.to_string())) else {
+            let Some(model_name) = path
+                .file_stem()
+                .and_then(OsStr::to_str)
+                .map(|n| Sy!(n.to_string()))
+            else {
                 continue;
             };
             let maybe_model = session.sync_odoo.models.get(&model_name).cloned();
-            let model_exists = maybe_model.as_ref().map(|m| m.borrow_mut().has_symbols()).unwrap_or(false);
+            let model_exists = maybe_model
+                .as_ref()
+                .map(|m| m.borrow_mut().has_symbols())
+                .unwrap_or(false);
             if !model_exists {
-                if let Some(diagnostic) = create_diagnostic(session, DiagnosticCode::OLS05056, &[&model_name]) {
+                if let Some(diagnostic) =
+                    create_diagnostic(session, DiagnosticCode::OLS05056, &[&model_name])
+                {
                     diagnostics.push(Diagnostic {
-                        range: Range::new(Position::new(data_range.start().to_u32(), 0), Position::new(data_range.end().to_u32(), 0)),
+                        range: Range::new(
+                            Position::new(data_range.start().to_u32(), 0),
+                            Position::new(data_range.end().to_u32(), 0),
+                        ),
                         ..diagnostic.clone()
                     });
                 }
-                symbol.borrow_mut().as_module_package_mut().not_found_models.insert(model_name.clone(), BuildSteps::VALIDATION);
-                session.sync_odoo.get_main_entry().borrow_mut().not_found_symbols_for_models.insert(symbol.clone());
+                symbol
+                    .borrow_mut()
+                    .as_module_package_mut()
+                    .not_found_models
+                    .insert(model_name.clone(), BuildSteps::VALIDATION);
+                session
+                    .sync_odoo
+                    .get_main_entry()
+                    .borrow_mut()
+                    .not_found_symbols_for_models
+                    .insert(symbol.clone());
             }
         }
-        let manifest_path = PathBuf::from(symbol.borrow().as_module_package().root_path.clone()).join("__manifest__.py");
-        let manifest_file_info = session.sync_odoo.get_file_mgr().borrow().get_file_info(&manifest_path.sanitize()).expect("file not found in cache").clone();
+        let manifest_path = PathBuf::from(symbol.borrow().as_module_package().root_path.clone())
+            .join("__manifest__.py");
+        let Some(manifest_file_info) = session
+            .sync_odoo
+            .get_file_mgr()
+            .borrow()
+            .get_file_info(&manifest_path.sanitize())
+        else {
+            warn!("Manifest file not found for module, skipping validation diagnostics");
+            return;
+        };
         let mut manifest_file_info = (*manifest_file_info).borrow_mut();
-        manifest_file_info.replace_diagnostics(crate::constants::BuildSteps::VALIDATION, diagnostics);
+        manifest_file_info
+            .replace_diagnostics(crate::constants::BuildSteps::VALIDATION, diagnostics);
         manifest_file_info.publish_diagnostics(session);
     }
 
@@ -403,18 +683,42 @@ impl ModuleSymbol {
         for (data_url, _data_range) in data_paths.iter() {
             //load data from file
             let path = PathBuf::from(symbol.borrow().paths()[0].clone()).join(data_url);
-            let (_, file_info) = session.sync_odoo.get_file_mgr().borrow_mut().update_file_info(session, &path.sanitize(), None, None, false); //create ast if not in cache
+            let (_, file_info) = session
+                .sync_odoo
+                .get_file_mgr()
+                .borrow_mut()
+                .update_file_info(session, &path.sanitize(), None, None, false); //create ast if not in cache
             let mut file_info = file_info.borrow_mut();
             let file_name = path.file_name().unwrap().to_str().unwrap().to_string();
             if file_name.ends_with(".xml") {
-                let xml_sym = symbol.borrow_mut().add_new_xml_file(session, &file_name, &path.sanitize());
-                symbol.borrow_mut().add_dependency(&mut xml_sym.borrow_mut(), BuildSteps::ARCH, BuildSteps::ARCH);
-                if file_info.file_info_ast.borrow().text_document.as_ref().is_none() {
+                let xml_sym =
+                    symbol
+                        .borrow_mut()
+                        .add_new_xml_file(session, &file_name, &path.sanitize());
+                symbol.borrow_mut().add_dependency(
+                    &mut xml_sym.borrow_mut(),
+                    BuildSteps::ARCH,
+                    BuildSteps::ARCH,
+                );
+                if file_info
+                    .file_info_ast
+                    .borrow()
+                    .text_document
+                    .as_ref()
+                    .is_none()
+                {
                     //TODO do we want to add a diagnostic here?
                     continue;
                 }
                 //That's a little bit crappy, but the SYNTAX step of XML files are done here, as lifetime of roXMLTree are not flexible enough to be separated from the Arch building
-                let data = file_info.file_info_ast.borrow().text_document.as_ref().unwrap().contents().to_string();
+                let data = file_info
+                    .file_info_ast
+                    .borrow()
+                    .text_document
+                    .as_ref()
+                    .unwrap()
+                    .contents()
+                    .to_string();
                 let document = roxmltree::Document::parse(&data);
                 if let Ok(document) = document {
                     file_info.replace_diagnostics(BuildSteps::SYNTAX, vec![]);
@@ -423,22 +727,48 @@ impl ModuleSymbol {
                     xml_builder.load_arch(session, &mut file_info, &root);
                 } else if data.len() > 0 {
                     let mut diagnostics = vec![];
-                    XmlFileSymbol::build_syntax_diagnostics(&session, &mut diagnostics, &mut file_info, &document.unwrap_err());
+                    XmlFileSymbol::build_syntax_diagnostics(
+                        &session,
+                        &mut diagnostics,
+                        &mut file_info,
+                        &document.unwrap_err(),
+                    );
                     file_info.replace_diagnostics(BuildSteps::SYNTAX, diagnostics);
                     file_info.publish_diagnostics(session);
-                    continue
+                    continue;
                 }
             } else if file_name.ends_with(".csv") {
-                let csv_sym = symbol.borrow_mut().add_new_csv_file(session, &file_name, &path.sanitize());
-                symbol.borrow_mut().add_dependency(&mut csv_sym.borrow_mut(), BuildSteps::ARCH, BuildSteps::ARCH);
-                if file_info.file_info_ast.borrow().text_document.as_ref().is_none() {
+                let csv_sym =
+                    symbol
+                        .borrow_mut()
+                        .add_new_csv_file(session, &file_name, &path.sanitize());
+                symbol.borrow_mut().add_dependency(
+                    &mut csv_sym.borrow_mut(),
+                    BuildSteps::ARCH,
+                    BuildSteps::ARCH,
+                );
+                if file_info
+                    .file_info_ast
+                    .borrow()
+                    .text_document
+                    .as_ref()
+                    .is_none()
+                {
                     //TODO do we want to add a diagnostic here?
                     continue;
                 }
-                let data = file_info.file_info_ast.borrow().text_document.as_ref().unwrap().contents().to_string();
+                let data = file_info
+                    .file_info_ast
+                    .borrow()
+                    .text_document
+                    .as_ref()
+                    .unwrap()
+                    .contents()
+                    .to_string();
                 let mut csv_builder = CsvArchBuilder::new();
                 csv_builder.load_csv(session, csv_sym, &data);
-            } else if !file_name.ends_with(".sql") { // Do nothing for sql files for now, but also no error log
+            } else if !file_name.ends_with(".sql") {
+                // Do nothing for sql files for now, but also no error log
                 error!("Unsupported data file type: {}", file_name);
             }
         }
@@ -449,7 +779,9 @@ impl ModuleSymbol {
         let tests_path = PathBuf::from(root_path).join("tests");
         if tests_path.exists() {
             let rc_symbol = Symbol::create_from_path(session, &tests_path, symbol, false);
-            if rc_symbol.is_some() && rc_symbol.as_ref().unwrap().borrow().typ() != SymType::NAMESPACE {
+            if rc_symbol.is_some()
+                && rc_symbol.as_ref().unwrap().borrow().typ() != SymType::NAMESPACE
+            {
                 let rc_symbol = rc_symbol.unwrap();
                 session.sync_odoo.add_to_rebuild_arch(rc_symbol);
             }
@@ -457,21 +789,35 @@ impl ModuleSymbol {
         vec![]
     }
 
-    pub fn is_in_deps(_session: &mut SessionInfo, symbol: &Rc<RefCell<Symbol>>, dir_name: &OYarn) -> bool {
-        symbol.borrow().as_module_package().dir_name == *dir_name || symbol.borrow().as_module_package().all_depends.contains(dir_name)
+    pub fn is_in_deps(
+        _session: &mut SessionInfo,
+        symbol: &Rc<RefCell<Symbol>>,
+        dir_name: &OYarn,
+    ) -> bool {
+        symbol.borrow().as_module_package().dir_name == *dir_name
+            || symbol
+                .borrow()
+                .as_module_package()
+                .all_depends
+                .contains(dir_name)
     }
 
     pub fn get_all_depends(&self) -> &HashSet<OYarn> {
         &self.all_depends
     }
 
-    pub fn get_dependencies(&self, step: usize, level: usize) -> Option<&PtrWeakHashSet<Weak<RefCell<Symbol>>>>
-    {
+    pub fn get_dependencies(
+        &self,
+        step: usize,
+        level: usize,
+    ) -> Option<&PtrWeakHashSet<Weak<RefCell<Symbol>>>> {
         self.dependencies.get(step)?.get(level)?.as_ref()
     }
 
-    pub fn get_all_dependencies(&self, step: usize) -> Option<&Vec<Option<PtrWeakHashSet<Weak<RefCell<Symbol>>>>>>
-    {
+    pub fn get_all_dependencies(
+        &self,
+        step: usize,
+    ) -> Option<&Vec<Option<PtrWeakHashSet<Weak<RefCell<Symbol>>>>>> {
         self.dependencies.get(step)
     }
 
@@ -479,18 +825,22 @@ impl ModuleSymbol {
         &self.dependencies
     }
 
-    pub fn dependencies_mut(&mut self) -> &mut Vec<Vec<Option<PtrWeakHashSet<Weak<RefCell<Symbol>>>>>> {
+    pub fn dependencies_mut(
+        &mut self,
+    ) -> &mut Vec<Vec<Option<PtrWeakHashSet<Weak<RefCell<Symbol>>>>>> {
         &mut self.dependencies
     }
 
     pub fn set_in_workspace(&mut self, in_workspace: bool) {
         self.in_workspace = in_workspace;
         if in_workspace {
-            self.dependencies= vec![
-                vec![ //ARCH
-                    None //ARCH
+            self.dependencies = vec![
+                vec![
+                    //ARCH
+                    None, //ARCH
                 ],
-                vec![ //ARCH_EVAL
+                vec![
+                    //ARCH_EVAL
                     None, //ARCH,
                     None, //ARCH_EVAL
                 ],
@@ -498,21 +848,24 @@ impl ModuleSymbol {
                     None, // ARCH
                     None, //ARCH_EVAL
                     None, //VALIDATIOn
-                ]
+                ],
             ];
             self.dependents = vec![
-                vec![ //ARCH
+                vec![
+                    //ARCH
                     None, //ARCH
                     None, //ARCH_EVAL
                     None, //VALIDATION
                 ],
-                vec![ //ARCH_EVAL
+                vec![
+                    //ARCH_EVAL
                     None, //ARCH_EVAL
-                    None //VALIDATION
+                    None, //VALIDATION
                 ],
-                vec![ //VALIDATION
-                    None //VALIDATION
-                ]
+                vec![
+                    //VALIDATION
+                    None, //VALIDATION
+                ],
             ];
         }
     }
@@ -521,17 +874,24 @@ impl ModuleSymbol {
         &self.dependents
     }
 
-    pub fn dependents_mut(&mut self) -> &mut Vec<Vec<Option<PtrWeakHashSet<Weak<RefCell<Symbol>>>>>> {
+    pub fn dependents_mut(
+        &mut self,
+    ) -> &mut Vec<Vec<Option<PtrWeakHashSet<Weak<RefCell<Symbol>>>>>> {
         &mut self.dependents
     }
 
-    pub fn get_dependents(&self, level: usize, step: usize) -> Option<&PtrWeakHashSet<Weak<RefCell<Symbol>>>>
-    {
+    pub fn get_dependents(
+        &self,
+        level: usize,
+        step: usize,
+    ) -> Option<&PtrWeakHashSet<Weak<RefCell<Symbol>>>> {
         self.dependents.get(level)?.get(step)?.as_ref()
     }
 
-    pub fn get_all_dependents(&self, level: usize) -> Option<&Vec<Option<PtrWeakHashSet<Weak<RefCell<Symbol>>>>>>
-    {
+    pub fn get_all_dependents(
+        &self,
+        level: usize,
+    ) -> Option<&Vec<Option<PtrWeakHashSet<Weak<RefCell<Symbol>>>>>> {
         self.dependents.get(level)
     }
 
@@ -544,13 +904,20 @@ impl ModuleSymbol {
         if let Some(owners) = self.ext_symbols.get(name) {
             for owner in owners.iter() {
                 let owner = owner.borrow();
-                result.extend(owner.get_decl_ext_symbol(&self.weak_self.as_ref().unwrap().upgrade().unwrap(), name));
+                result.extend(owner.get_decl_ext_symbol(
+                    &self.weak_self.as_ref().unwrap().upgrade().unwrap(),
+                    name,
+                ));
             }
         }
         result
     }
 
-    pub fn get_decl_ext_symbol(&self, symbol: &Rc<RefCell<Symbol>>, name: &OYarn) -> Vec<Rc<RefCell<Symbol>>> {
+    pub fn get_decl_ext_symbol(
+        &self,
+        symbol: &Rc<RefCell<Symbol>>,
+        name: &OYarn,
+    ) -> Vec<Rc<RefCell<Symbol>>> {
         let mut result = vec![];
         if let Some(object_decl_symbols) = self.decl_ext_symbols.get(symbol) {
             if let Some(symbols) = object_decl_symbols.get(name) {
@@ -563,7 +930,10 @@ impl ModuleSymbol {
         result
     }
 
-    pub fn this_and_dependencies(&self, session: &mut SessionInfo) -> PtrWeakHashSet<Weak<RefCell<Symbol>>> {
+    pub fn this_and_dependencies(
+        &self,
+        session: &mut SessionInfo,
+    ) -> PtrWeakHashSet<Weak<RefCell<Symbol>>> {
         let mut result = PtrWeakHashSet::new();
         result.insert(self.weak_self.as_ref().unwrap().upgrade().unwrap());
         for dep in self.depends.iter() {
@@ -606,9 +976,17 @@ impl ModuleSymbol {
             xml_id_locations: HashMap::new(),
             xml_ids: HashMap::new(),
             dir_name: oyarn!("{}", cached.dir_name),
-            depends: cached.depends.iter().map(|d| (oyarn!("{}", d), TextRange::default())).collect(),
+            depends: cached
+                .depends
+                .iter()
+                .map(|d| (oyarn!("{}", d), TextRange::default()))
+                .collect(),
             all_depends: cached.all_depends.iter().map(|d| oyarn!("{}", d)).collect(),
-            data: cached.data.iter().map(|d| (d.clone(), TextRange::default())).collect(),
+            data: cached
+                .data
+                .iter()
+                .map(|d| (d.clone(), TextRange::default()))
+                .collect(),
             weak_self: None,
             parent: None,
             module_symbols: HashMap::new(),
@@ -630,34 +1008,59 @@ impl ModuleSymbol {
         Some(module)
     }
 
-    pub fn populate_models_from_cache_static(session: &mut SessionInfo, cached: &CachedModule, module_symbol_rc: Rc<RefCell<Symbol>>) {
-        if let Symbol::Package(super::package_symbol::PackageSymbol::Module(ref mut m)) = *module_symbol_rc.borrow_mut() {
+    pub fn populate_models_from_cache_static(
+        session: &mut SessionInfo,
+        cached: &CachedModule,
+        module_symbol_rc: Rc<RefCell<Symbol>>,
+    ) {
+        if let Symbol::Package(super::package_symbol::PackageSymbol::Module(ref mut m)) =
+            *module_symbol_rc.borrow_mut()
+        {
             m.populate_models_from_cache(session, cached, module_symbol_rc.clone());
         }
     }
 
-    pub fn populate_files_from_cache_static(session: &mut SessionInfo, cached: &CachedModule, module_symbol_rc: Rc<RefCell<Symbol>>) {
-        if let Symbol::Package(super::package_symbol::PackageSymbol::Module(ref mut m)) = *module_symbol_rc.borrow_mut() {
+    pub fn populate_files_from_cache_static(
+        session: &mut SessionInfo,
+        cached: &CachedModule,
+        module_symbol_rc: Rc<RefCell<Symbol>>,
+    ) {
+        if let Symbol::Package(super::package_symbol::PackageSymbol::Module(ref mut m)) =
+            *module_symbol_rc.borrow_mut()
+        {
             m.populate_files_from_cache(session, cached, module_symbol_rc.clone());
         }
     }
 
-    pub fn populate_models_from_cache(&mut self, session: &mut SessionInfo, cached: &CachedModule, module_symbol_rc: Rc<RefCell<Symbol>>) {
+    pub fn populate_models_from_cache(
+        &mut self,
+        session: &mut SessionInfo,
+        cached: &CachedModule,
+        module_symbol_rc: Rc<RefCell<Symbol>>,
+    ) {
         for cached_model in &cached.models {
             let model_name = oyarn!("{}", cached_model.name);
             let range = TextRange::default();
             let mut class_symbol = crate::core::symbols::class_symbol::ClassSymbol::new(
-                cached_model.name.clone(), 
-                range, 
-                0.into(), 
-                self.is_external
+                cached_model.name.clone(),
+                range,
+                0.into(),
+                self.is_external,
             );
-            
+
             let mut model_data = crate::core::model::ModelData::new();
             model_data.name = model_name.clone();
             model_data.description = cached_model.description.clone();
-            model_data.inherit = cached_model.inherit.iter().map(|s| oyarn!("{}", s)).collect();
-            model_data.inherits = cached_model.inherits.iter().map(|(k, v)| (oyarn!("{}", k), oyarn!("{}", v))).collect();
+            model_data.inherit = cached_model
+                .inherit
+                .iter()
+                .map(|s| oyarn!("{}", s))
+                .collect();
+            model_data.inherits = cached_model
+                .inherits
+                .iter()
+                .map(|(k, v)| (oyarn!("{}", k), oyarn!("{}", v)))
+                .collect();
             model_data.is_abstract = cached_model.is_abstract;
             model_data.transient = cached_model.transient;
             model_data.table = cached_model.table.clone();
@@ -667,51 +1070,80 @@ impl ModuleSymbol {
             model_data.log_access = cached_model.log_access;
             model_data.parent_name = cached_model.parent_name.clone();
             model_data.active_name = cached_model.active_name.clone();
-            
+
             class_symbol._model = Some(model_data);
-            
+
             for cached_field in &cached_model.fields {
                 let field_name = oyarn!("{}", cached_field.name);
                 let variable_symbol = crate::core::symbols::variable_symbol::VariableSymbol::new(
                     field_name.clone(),
                     TextRange::default(),
-                    self.is_external
+                    self.is_external,
                 );
                 let variable_rc = Rc::new(RefCell::new(Symbol::Variable(variable_symbol)));
-                variable_rc.borrow_mut().set_weak_self(Rc::downgrade(&variable_rc));
-                
-                let sections = class_symbol.symbols.entry(field_name).or_insert(HashMap::new());
+                variable_rc
+                    .borrow_mut()
+                    .set_weak_self(Rc::downgrade(&variable_rc));
+
+                let sections = class_symbol
+                    .symbols
+                    .entry(field_name)
+                    .or_insert(HashMap::new());
                 let section_vec = sections.entry(0).or_insert(vec![]);
                 section_vec.push(variable_rc);
             }
 
             let class_rc = Rc::new(RefCell::new(Symbol::Class(class_symbol)));
-            class_rc.borrow_mut().set_weak_self(Rc::downgrade(&class_rc));
-            class_rc.borrow_mut().set_parent(Some(Rc::downgrade(&module_symbol_rc)));
-            
-            self.module_symbols.insert(oyarn!("{}", cached_model.name), class_rc.clone());
-            
-            let model_rc = session.sync_odoo.models.entry(model_name.clone()).or_insert_with(|| {
-                Rc::new(RefCell::new(crate::core::model::Model::new(model_name.clone(), class_rc.clone())))
-            }).clone();
-            model_rc.borrow_mut().add_symbol_with_module(session, class_rc.clone(), None);
+            class_rc
+                .borrow_mut()
+                .set_weak_self(Rc::downgrade(&class_rc));
+            class_rc
+                .borrow_mut()
+                .set_parent(Some(Rc::downgrade(&module_symbol_rc)));
+
+            self.module_symbols
+                .insert(oyarn!("{}", cached_model.name), class_rc.clone());
+
+            let model_rc = session
+                .sync_odoo
+                .models
+                .entry(model_name.clone())
+                .or_insert_with(|| {
+                    Rc::new(RefCell::new(crate::core::model::Model::new(
+                        model_name.clone(),
+                        class_rc.clone(),
+                    )))
+                })
+                .clone();
+            model_rc
+                .borrow_mut()
+                .add_symbol_with_module(session, class_rc.clone(), None);
         }
     }
 
-    pub fn populate_files_from_cache(&mut self, session: &mut crate::threads::SessionInfo, cached: &CachedModule, module_symbol_rc: Rc<RefCell<Symbol>>) {
-        use crate::core::cache::restore_file_from_cache;
+    pub fn populate_files_from_cache(
+        &mut self,
+        session: &mut crate::threads::SessionInfo,
+        cached: &CachedModule,
+        module_symbol_rc: Rc<RefCell<Symbol>>,
+    ) {
         use crate::constants::SymType;
-        
+        use crate::core::cache::restore_file_from_cache;
+
         for cached_file in &cached.files {
-            let file_rc = restore_file_from_cache(cached_file, module_symbol_rc.clone(), self.is_external);
+            let file_rc =
+                restore_file_from_cache(cached_file, module_symbol_rc.clone(), self.is_external);
             let name = file_rc.borrow().name().clone();
             let path = cached_file.path.clone();
-            
+
             self.module_symbols.insert(name, file_rc.clone());
-            
-            session.sync_odoo.get_file_mgr().borrow_mut()
+
+            session
+                .sync_odoo
+                .get_file_mgr()
+                .borrow_mut()
                 .create_file_info_for_cached(&path, cached_file.processed_text_hash);
-            
+
             if file_rc.borrow().typ() == SymType::FILE {
                 self.data_symbols.insert(path, file_rc);
             }
@@ -737,11 +1169,11 @@ impl ModuleSymbol {
                                         let field_sym = field_sym_rc.borrow();
                                         // Check if it's a variable (potential field)
                                         if let SymType::VARIABLE = field_sym.typ() {
-                                            // For now, we only capture the name. 
+                                            // For now, we only capture the name.
                                             // Type inference requires evaluation which is complex to serialize.
                                             cached_fields.push(CachedField {
                                                 name: field_sym.name().to_string(),
-                                                field_type: "Unknown".to_string(), 
+                                                field_type: "Unknown".to_string(),
                                                 string: None,
                                                 required: false,
                                                 readonly: false,
@@ -762,7 +1194,11 @@ impl ModuleSymbol {
                                 name: model_data.name.to_string(),
                                 description: model_data.description.clone(),
                                 inherit: model_data.inherit.iter().map(|s| s.to_string()).collect(),
-                                inherits: model_data.inherits.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect(),
+                                inherits: model_data
+                                    .inherits
+                                    .iter()
+                                    .map(|(k, v)| (k.to_string(), v.to_string()))
+                                    .collect(),
                                 fields: cached_fields,
                                 is_abstract: model_data.is_abstract,
                                 transient: model_data.transient,
@@ -789,9 +1225,9 @@ impl ModuleSymbol {
             for (path, file_info) in file_mgr.files.iter() {
                 if path.starts_with(&self.path) {
                     // Use last_modified as a proxy for hash
-                     if let Some(mtime) = file_info.borrow().last_modified {
-                         file_hashes.insert(path.clone(), mtime);
-                     }
+                    if let Some(mtime) = file_info.borrow().last_modified {
+                        file_hashes.insert(path.clone(), mtime);
+                    }
                 }
             }
         }
@@ -816,6 +1252,4 @@ impl ModuleSymbol {
     fn collect_cached_files(&self, _session: &SessionInfo) -> Vec<crate::core::cache::CachedFile> {
         crate::core::cache::collect_files_recursively(&self.module_symbols)
     }
-
-
 }

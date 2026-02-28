@@ -1,7 +1,7 @@
 use std::{cell::RefCell, cmp::Ordering, collections::{HashMap, HashSet}, rc::Rc};
 
 use lsp_types::{Diagnostic, Position, Range};
-use tracing::{info, trace};
+use tracing::{info, trace, warn};
 
 use crate::{Sy, constants::{BuildSteps, DEBUG_STEPS, OYarn}, core::{diagnostics::{DiagnosticCode, create_diagnostic}, entry_point::{EntryPoint, EntryPointType}, evaluation::ContextValue, file_mgr::FileInfo, model::Model, odoo::SyncOdoo, symbols::symbol::Symbol, xml_data::{OdooData, OdooDataRecord, XmlDataDelete, XmlDataMenuItem, XmlDataTemplate}}, oyarn, threads::SessionInfo, utils::compare_semver};
 
@@ -22,11 +22,10 @@ impl XmlValidator {
         }
     }
 
-    fn get_file_info(&mut self, odoo: &mut SyncOdoo) -> Rc<RefCell<FileInfo>> {
+    fn get_file_info(&mut self, odoo: &mut SyncOdoo) -> Option<Rc<RefCell<FileInfo>>> {
         let file_symbol = self.xml_symbol.borrow();
         let path = file_symbol.paths()[0].clone();
-        let file_info_rc = odoo.get_file_mgr().borrow().get_file_info(&path).expect("File not found in cache").clone();
-        file_info_rc
+        odoo.get_file_mgr().borrow().get_file_info(&path)
     }
 
     pub fn validate(&mut self, session: &mut SessionInfo) {
@@ -53,7 +52,10 @@ impl XmlValidator {
             session.sync_odoo.get_main_entry().borrow_mut().not_found_symbols_for_models.insert(self.xml_symbol.clone());
         }
         self.xml_symbol.borrow_mut().as_xml_file_sym_mut().not_found_models.extend(missing_model_dependencies.into_iter().map(|m| (m, BuildSteps::VALIDATION)));
-        let file_info = self.get_file_info(&mut session.sync_odoo);
+        let Some(file_info) = self.get_file_info(&mut session.sync_odoo) else {
+            warn!("File info not found for XML validation, skipping diagnostics");
+            return;
+        };
         file_info.borrow_mut().replace_diagnostics(BuildSteps::VALIDATION, diagnostics);
         file_info.borrow_mut().publish_diagnostics(session);
     }

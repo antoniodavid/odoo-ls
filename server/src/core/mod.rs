@@ -6,6 +6,8 @@ pub mod evaluation;
 pub mod entry_point;
 pub mod file_mgr;
 pub mod import_resolver;
+pub mod js_parser;
+pub mod js_index;
 pub mod model;
 pub mod module_load_order;
 pub mod odoo;
