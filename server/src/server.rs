@@ -484,32 +484,15 @@ impl Server {
                     ResolveCompletionItem::METHOD => {
                         info!("Got ignored CompletionItem/resolve")
                     }
-                    _ => {panic!("Not handled Request Id: {}", r.method)}
-                }
-            },
-            Message::Response(r) => {
-                if DEBUG_THREADS {
-                    info!("Sending response to main thread : {}", r.id);
-                }
-                self.res_sender_s_to_main.send(Message::Response(r)).unwrap();
-            },
-            Message::Notification(n) => {
-                match n.method.as_str() {
-                    DidOpenTextDocument::METHOD | DidChangeConfiguration::METHOD | DidChangeWorkspaceFolders::METHOD |
-                    DidChangeTextDocument::METHOD | DidCloseTextDocument::METHOD | DidSaveTextDocument::METHOD |
-                    DidRenameFiles::METHOD | DidCreateFiles::METHOD | DidChangeWatchedFiles::METHOD | DidDeleteFiles::METHOD => {
-                        if DEBUG_THREADS {
-                            info!("Sending notification to main thread : {}", n.method);
-                        }
-                        self.interrupt_rebuild_boolean.store(true, std::sync::atomic::Ordering::SeqCst);
-                        self.req_sender_s_to_main.send(Message::Notification(n)).unwrap();
                     _ => {
                         panic!("Not handled Request Id: {}", r.method)
                     }
                 }
             }
             Message::Response(r) => {
-                info!("Sending response to main thread : {}", r.id);
+                if DEBUG_THREADS {
+                    info!("Sending response to main thread : {}", r.id);
+                }
                 self.res_sender_s_to_main
                     .send(Message::Response(r))
                     .unwrap();
