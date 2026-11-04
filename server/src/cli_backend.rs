@@ -270,6 +270,7 @@ mod tests {
     use super::*;
     use assert_fs::prelude::*;
     use assert_fs::TempDir;
+    use crate::args::ColorMode;
     use crate::args::LogLevel;
     use crate::core::config::DEFAULT_PROFILE_NAME;
     use crate::utils::PathSanitizer;
@@ -291,6 +292,7 @@ mod tests {
             logs_directory: None,
             config_path: None,
             selected_config: None,
+            color: ColorMode::Auto,
         }
     }
 
